@@ -1,0 +1,48 @@
+[
+  {
+    "name": "26.2 Предельный цикл / Limit cycle",
+    "equations": [
+      "x3*x2",
+      "x3*(-x1 + sin(x2))",
+      "0",
+      "0"
+    ],
+    "var_names": [
+      "x1",
+      "x2",
+      "x3",
+      "x4"
+    ],
+    "T": 1.0,
+    "initial_values": {
+      "0": null,
+      "1": 0.0,
+      "2": null,
+      "3": null
+    },
+    "boundary_conditions": [
+      "x0_0 - x3_0",
+      "x0_T - x3_0",
+      "x1_T"
+    ],
+    "guess": [
+      2.0,
+      6.283185,
+      2.0
+    ],
+    "eps": 1e-08,
+    "method": "RK45",
+    "solver_method": "continuation",
+    "continuation_steps": 100,
+    "known_indices": [
+      1
+    ],
+    "unknown_indices": [
+      0,
+      2,
+      3
+    ],
+    "t_star": 0.0,
+    "aux_outputs": {}
+  }
+]

@@ -1,0 +1,233 @@
+[
+  {
+    "name": "26.1 Двухтельная / Two-body",
+    "equations": [
+      "vx",
+      "vy",
+      "-x/(x**2 + y**2)**1.5",
+      "-y/(x**2 + y**2)**1.5"
+    ],
+    "var_names": [
+      "x",
+      "y",
+      "vx",
+      "vy"
+    ],
+    "T": 7.0,
+    "initial_values": {
+      "0": 2.0,
+      "1": 0.0,
+      "2": null,
+      "3": null
+    },
+    "boundary_conditions": [
+      "x0_T - 1.0738644361",
+      "x1_T + 1.0995343576"
+    ],
+    "guess": [
+      0.5,
+      -0.5
+    ],
+    "eps": 1e-08,
+    "method": "RK45",
+    "solver_method": "continuation",
+    "continuation_steps": 50,
+    "known_indices": [
+      0,
+      1
+    ],
+    "unknown_indices": [
+      2,
+      3
+    ],
+    "t_star": 0.0,
+    "aux_outputs": {}
+  },
+  {
+    "name": "26.2 Предельный цикл / Limit cycle",
+    "equations": [
+      "x3*x2",
+      "x3*(-x1 + sin(x2))",
+      "0",
+      "0"
+    ],
+    "var_names": [
+      "x1",
+      "x2",
+      "x3",
+      "x4"
+    ],
+    "T": 1.0,
+    "initial_values": {
+      "0": null,
+      "1": 0.0,
+      "2": null,
+      "3": null
+    },
+    "boundary_conditions": [
+      "x0_0 - x3_0",
+      "x0_T - x3_0",
+      "x1_T"
+    ],
+    "guess": [
+      2.0,
+      6.283185,
+      2.0
+    ],
+    "eps": 1e-08,
+    "method": "RK45",
+    "solver_method": "continuation",
+    "continuation_steps": 100,
+    "known_indices": [
+      1
+    ],
+    "unknown_indices": [
+      0,
+      2,
+      3
+    ],
+    "t_star": 0.0,
+    "aux_outputs": {}
+  },
+  {
+    "name": "26.3 Тройной интегратор / Triple integrator",
+    "equations": [
+      "x1",
+      "x2",
+      "0.5*(sqrt(1e-10 + (x5 + 1)**2) - sqrt(1e-10 + (x5 - 1)**2))",
+      "0",
+      "-x3",
+      "-x4"
+    ],
+    "var_names": [
+      "x0",
+      "x1",
+      "x2",
+      "x3",
+      "x4",
+      "x5"
+    ],
+    "T": 3.275,
+    "initial_values": {
+      "0": 1.0,
+      "1": 0.0,
+      "2": 0.0,
+      "3": null,
+      "4": null,
+      "5": null
+    },
+    "boundary_conditions": [
+      "x0_T",
+      "x1_T",
+      "x2_T"
+    ],
+    "guess": [
+      -2.9850435834,
+      -4.8880088678,
+      -2.9083874538
+    ],
+    "eps": 1e-08,
+    "method": "RK45",
+    "solver_method": "continuation",
+    "continuation_steps": 50,
+    "known_indices": [
+      0,
+      1,
+      2
+    ],
+    "unknown_indices": [
+      3,
+      4,
+      5
+    ],
+    "t_star": 0.0,
+    "aux_outputs": {
+      "u": "0.5*(sqrt(1e-10 + (x5 + 1)**2) - sqrt(1e-10 + (x5 - 1)**2))"
+    }
+  },
+  {
+    "name": "26.4 Лунка / Time-optimal (lunula)",
+    "equations": [
+      "x4*(x1 + sqrt(2)*x2/sqrt(x2**2+x3**2) - 0.5*(sqrt(1e-6 + (sqrt(2)*x2/sqrt(x2**2+x3**2)+1)**2) - sqrt(1e-6 + (sqrt(2)*x2/sqrt(x2**2+x3**2)-1)**2)))",
+      "x4*(-1.5*x0 - 0.25*x1 + 0.5*(sqrt(1e-6 + (sqrt(2)*x3/sqrt(x2**2+x3**2)+1)**2) - sqrt(1e-6 + (sqrt(2)*x3/sqrt(x2**2+x3**2)-1)**2)))",
+      "x4*1.5*x3",
+      "x4*(-x2 + 0.25*x3)",
+      "0"
+    ],
+    "var_names": [
+      "x0",
+      "x1",
+      "x2",
+      "x3",
+      "x4"
+    ],
+    "T": 1.0,
+    "initial_values": {
+      "0": 4.0,
+      "1": 1.0,
+      "2": null,
+      "3": null,
+      "4": null
+    },
+    "boundary_conditions": [
+      "x0_T",
+      "x1_T",
+      "x2_T**2 + x3_T**2 - 1"
+    ],
+    "guess": [
+      -0.54,
+      -0.13,
+      4.9
+    ],
+    "eps": 1e-06,
+    "method": "RK45",
+    "solver_method": "shooting",
+    "continuation_steps": 50,
+    "known_indices": [
+      0,
+      1
+    ],
+    "unknown_indices": [
+      2,
+      3,
+      4
+    ],
+    "t_star": 0.0,
+    "aux_outputs": {}
+  },
+  {
+    "name": "1",
+    "equations": [
+      "x1",
+      "-x0"
+    ],
+    "var_names": [
+      "x0",
+      "x1"
+    ],
+    "T": 6.28,
+    "initial_values": {
+      "0": 1.0,
+      "1": null
+    },
+    "boundary_conditions": [
+      "x0_T-1",
+      "x1_T"
+    ],
+    "guess": [
+      6.28
+    ],
+    "eps": 1e-08,
+    "method": "RK45",
+    "solver_method": "shooting",
+    "continuation_steps": 50,
+    "known_indices": [
+      0
+    ],
+    "unknown_indices": [
+      1
+    ],
+    "t_star": 0.0,
+    "aux_outputs": {}
+  }
+]

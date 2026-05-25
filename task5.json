@@ -1,0 +1,72 @@
+[
+  {
+    "name": "26.5 Скоростное управление (m=2) / Time-optimal m=2",
+    "equations": [
+      "T*vx",
+      "T*vy",
+      "T*(-x - 0.5*vx + psi3/sqrt(1e-10 + psi3**2 + psi4**2))",
+      "T*(-2*y - 0.3*vy + psi4/sqrt(1e-10 + psi3**2 + psi4**2))",
+      "T*psi3",
+      "T*2*psi4",
+      "T*(-psi1 + 0.5*psi3)",
+      "T*(-psi2 + 0.3*psi4)",
+      "0"
+    ],
+    "var_names": [
+      "x",
+      "y",
+      "vx",
+      "vy",
+      "psi1",
+      "psi2",
+      "psi3",
+      "psi4",
+      "T"
+    ],
+    "T": 1.0,
+    "initial_values": {
+      "0": 0.0,
+      "1": 0.0,
+      "2": 0.0,
+      "3": 0.0,
+      "4": null,
+      "5": null,
+      "6": null,
+      "7": null,
+      "8": null
+    },
+    "boundary_conditions": [
+      "x0_T - 1",
+      "x1_T - 1",
+      "x2_T",
+      "x3_T",
+      "x8_T*(sqrt(x6_T**2 + x7_T**2) - x6_T - 2*x7_T) - 1"
+    ],
+    "guess": [
+      0.0,
+      0.0,
+      1.0,
+      1.0,
+      3.0
+    ],
+    "eps": 1e-07,
+    "method": "RK45",
+    "solver_method": "continuation",
+    "continuation_steps": 200,
+    "known_indices": [
+      0,
+      1,
+      2,
+      3
+    ],
+    "unknown_indices": [
+      4,
+      5,
+      6,
+      7,
+      8
+    ],
+    "t_star": 0.0,
+    "aux_outputs": {}
+  }
+]

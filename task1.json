@@ -1,0 +1,46 @@
+[
+  {
+    "name": "26.1 Двухтельная / Two-body",
+    "equations": [
+      "vx",
+      "vy",
+      "-x/(x**2 + y**2)**1.5",
+      "-y/(x**2 + y**2)**1.5"
+    ],
+    "var_names": [
+      "x",
+      "y",
+      "vx",
+      "vy"
+    ],
+    "T": 7.0,
+    "initial_values": {
+      "0": 2.0,
+      "1": 0.0,
+      "2": null,
+      "3": null
+    },
+    "boundary_conditions": [
+      "x0_T - 1.0738644361",
+      "x1_T + 1.0995343576"
+    ],
+    "guess": [
+      0.5,
+      -0.5
+    ],
+    "eps": 1e-08,
+    "method": "RK45",
+    "solver_method": "continuation",
+    "continuation_steps": 50,
+    "known_indices": [
+      0,
+      1
+    ],
+    "unknown_indices": [
+      2,
+      3
+    ],
+    "t_star": 0.0,
+    "aux_outputs": {}
+  }
+]

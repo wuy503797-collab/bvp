@@ -1,0 +1,58 @@
+[
+  {
+    "name": "26.3 Тройной интегратор / Triple integrator",
+    "equations": [
+      "x1",
+      "x2",
+      "0.5*(sqrt(1e-10 + (x5 + 1)**2) - sqrt(1e-10 + (x5 - 1)**2))",
+      "0",
+      "-x3",
+      "-x4"
+    ],
+    "var_names": [
+      "x0",
+      "x1",
+      "x2",
+      "x3",
+      "x4",
+      "x5"
+    ],
+    "T": 3.275,
+    "initial_values": {
+      "0": 1.0,
+      "1": 0.0,
+      "2": 0.0,
+      "3": null,
+      "4": null,
+      "5": null
+    },
+    "boundary_conditions": [
+      "x0_T",
+      "x1_T",
+      "x2_T"
+    ],
+    "guess": [
+      -2.9850435834,
+      -4.8880088678,
+      -2.9083874538
+    ],
+    "eps": 1e-08,
+    "method": "RK45",
+    "solver_method": "continuation",
+    "continuation_steps": 50,
+    "known_indices": [
+      0,
+      1,
+      2
+    ],
+    "unknown_indices": [
+      3,
+      4,
+      5
+    ],
+    "t_star": 0.0,
+    "aux_outputs": {
+      "u": "0.5*(sqrt(1e-10 + (x5 + 1)**2) - sqrt(1e-10 + (x5 - 1)**2))"
+    }
+  }
+]
