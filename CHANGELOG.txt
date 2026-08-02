@@ -1,6 +1,15 @@
 CHANGELOG
 =========
 
+v2.4 (2026-08)
+- 新增不可变 SolveRequest、唯一 request_id 和来源快照
+- 新增 SolveRecord 成功历史及结构化完成、失败和取消事件
+- worker 信号绑定 request_id，过滤过期信号和重复终端信号
+- 新增集中 GUI 求解状态、单活动请求守卫和协作式取消
+- 窗口关闭时请求取消并有限等待，不使用 QThread.terminate
+- 辅助输出、绘图和导出改用结果自身的问题与变量快照
+- 不兼容跨任务结果默认隔离，辅助表达式失败保留逐项诊断
+
 v2.3 (2026-08)
 - 新增不依赖 GUI 生命周期的 bvp_core 公开入口
 - 新增不可变 BVPProblem、SolverConfig 和 BVPResult 模型

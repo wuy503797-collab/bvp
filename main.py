@@ -27,10 +27,13 @@
 
 import sys
 import json
+import logging
 import re
+import traceback
 import warnings
 from dataclasses import dataclass, field, asdict
 from typing import List, Callable, Optional, Tuple, Dict, Any
+from uuid import uuid4
 
 import numpy as np
 from numpy.linalg import norm, solve as np_solve
@@ -63,6 +66,23 @@ from PyQt5.QtWidgets import (
 )
 from PyQt5.QtCore import Qt, QThread, pyqtSignal, QSize
 from PyQt5.QtGui import QFont, QKeySequence, QColor
+
+from bvp_core.adapters import config_from_dataset, dataset_kwargs, problem_from_dataset
+from bvp_core.requests import (
+    CancellationToken,
+    GuiSolveState,
+    SolveCancelled,
+    SolveOutcome,
+    SolveOutcomeStatus,
+    SolveRecord,
+    SolveRequest,
+    gui_transition_allowed,
+    partition_plot_records,
+)
+from bvp_core.results import BVPResult
+
+
+LOGGER = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
 # 1. Dataset — централизованное хранение параметров задачи
@@ -415,14 +435,24 @@ class BVPSolver:
         см. разд. 7.25–7.26 методички.
     """
 
-    def __init__(self, dataset: Dataset, parser: SymPyParser):
+    def __init__(
+        self,
+        dataset: Dataset,
+        parser: SymPyParser,
+        cancellation_check: Optional[Callable[[], None]] = None,
+    ):
         self.ds = dataset
         self.parser = parser
+        self._cancellation_check = cancellation_check
         # Граничные условия как функция
         self.bc_residual = SymPyParser.parse_boundary_conditions(
             dataset.boundary_conditions, dataset.var_names
         )
         self._build_initial_state_mapper()
+
+    def _check_cancelled(self) -> None:
+        if self._cancellation_check is not None:
+            self._cancellation_check()
 
     def _build_initial_state_mapper(self):
         """
@@ -452,6 +482,7 @@ class BVPSolver:
     def _solve_ivp(self, p: np.ndarray, t_span: List[float],
                    dense_output: bool = False) -> Any:
         """Solve the inner IVP and preserve diagnostics for every failure."""
+        self._check_cancelled()
         x0 = self._p_to_state(p)
         try:
             sol = solve_ivp(
@@ -464,6 +495,8 @@ class BVPSolver:
             raise IVPIntegrationError(
                 f"solve_ivp raised {type(exc).__name__}: {exc}", p=p
             ) from exc
+
+        self._check_cancelled()
 
         t_values = np.asarray(sol.t, dtype=float)
         y_values = np.asarray(sol.y, dtype=float)
@@ -647,6 +680,7 @@ class BVPSolver:
         failure_message: Optional[str] = None,
     ) -> dict:
         """Re-integrate a candidate, recompute Phi, and apply final acceptance."""
+        self._check_cancelled()
         try:
             sol = self._solve_ivp(
                 p, [self.ds.t_star, self.ds.T], dense_output=True
@@ -661,6 +695,7 @@ class BVPSolver:
                 solver_metadata=solver_metadata,
             )
 
+        self._check_cancelled()
         try:
             residual = self.bc_residual(self._p_to_state(p), sol.y[:, -1])
         except Exception as exc:
@@ -680,6 +715,7 @@ class BVPSolver:
                 ),
             )
 
+        self._check_cancelled()
         return self._build_validated_result(
             p=p,
             sol=sol,
@@ -703,10 +739,14 @@ class BVPSolver:
         входит в уравнения как параметр-множитель, а интервал
         интегрирования остаётся [0, 1] (ds.T = 1.0).
         """
+        self._check_cancelled()
         sol = self._solve_ivp(p, [self.ds.t_star, self.ds.T])
+        self._check_cancelled()
         x0_full = self._p_to_state(p)
         xT_full = sol.y[:, -1]
-        return self.bc_residual(x0_full, xT_full)
+        residual = self.bc_residual(x0_full, xT_full)
+        self._check_cancelled()
+        return residual
 
     def _dPhi_dp(self, p: np.ndarray) -> np.ndarray:
         """
@@ -716,6 +756,7 @@ class BVPSolver:
           1. Пробуем совместное интегрирование + вариационное уравнение.
           2. При неудаче — чистое численное дифференцирование (надёжный fallback).
         """
+        self._check_cancelled()
         k = len(self.unknown)
         # Определяем размерность Φ(p) реальным вызовом
         Phi_base = self._Phi(p)
@@ -747,6 +788,7 @@ class BVPSolver:
                 rtol=max(1e-6, self.ds.eps), atol=max(1e-8, self.ds.eps / 100),
                 dense_output=False,
             )
+            self._check_cancelled()
             if sol.success:
                 yT = sol.y[:, -1]
                 XT = yT[n:].reshape(n, n)
@@ -759,6 +801,8 @@ class BVPSolver:
                     Phi_perturb = self._Phi(p_perturb)
                     jac_matrix[:, j] = (Phi_perturb - Phi_base) / eps_jac
                 return jac_matrix
+        except SolveCancelled:
+            raise
         except IVPIntegrationError:
             raise
         except Exception:
@@ -782,12 +826,15 @@ class BVPSolver:
         eps_jac = max(1e-7, min(1e-4, self.ds.eps ** 0.5))
         jac_matrix = np.zeros((m, k))
         for j in range(k):
+            self._check_cancelled()
             p_perturb = p.copy()
             h = eps_jac * max(1.0, abs(p[j]))
             p_perturb[j] += h
             try:
                 Phi_perturb = self._Phi(p_perturb)
                 jac_matrix[:, j] = (Phi_perturb - Phi_base) / h
+            except SolveCancelled:
+                raise
             except Exception:
                 # Односторонняя разность
                 p_perturb2 = p.copy()
@@ -822,6 +869,7 @@ class BVPSolver:
         """
         from scipy.optimize import least_squares
 
+        self._check_cancelled()
         p0 = np.array(self.ds.guess, dtype=float)
 
         def residual(p):
@@ -849,6 +897,7 @@ class BVPSolver:
                 tol=self.ds.eps,
                 options={"maxfev": 100 * len(p0)},
             )
+            self._check_cancelled()
             candidate = np.asarray(root_result.x, dtype=float)
             optimizer_success = bool(root_result.success)
             iterations = int(getattr(root_result, "nfev", 0))
@@ -859,6 +908,8 @@ class BVPSolver:
                 "message": optimizer_message,
                 "nfev": getattr(root_result, "nfev", None),
             }
+        except SolveCancelled:
+            raise
         except IVPIntegrationError as exc:
             solver_metadata["root"] = {
                 "success": False,
@@ -882,6 +933,7 @@ class BVPSolver:
         # Попытка 2: least_squares. Нормальное завершение оптимизатора не
         # является критерием выполнения граничных условий.
         if not optimizer_success:
+            self._check_cancelled()
             solver_metadata["fallback_used"] = True
             solver_metadata["optimizer"] = "least_squares"
             if callback:
@@ -895,6 +947,7 @@ class BVPSolver:
                     gtol=self.ds.eps,
                     max_nfev=5000 * len(p0),
                 )
+                self._check_cancelled()
                 candidate = np.asarray(ls_result.x, dtype=float)
                 optimizer_success = bool(ls_result.success)
                 iterations = int(getattr(ls_result, "nfev", 0))
@@ -907,6 +960,8 @@ class BVPSolver:
                     "optimality": getattr(ls_result, "optimality", None),
                     "nfev": getattr(ls_result, "nfev", None),
                 }
+            except SolveCancelled:
+                raise
             except IVPIntegrationError as exc:
                 solver_metadata["least_squares"] = {
                     "success": False,
@@ -929,6 +984,7 @@ class BVPSolver:
                     "message": optimizer_message,
                 }
 
+        self._check_cancelled()
         result = self._validate_final_candidate(
             p=candidate,
             optimizer_success=optimizer_success,
@@ -968,6 +1024,7 @@ class BVPSolver:
         методом Ньютона, стартуя с решения предыдущего шага. Это позволяет
         устойчиво следовать вдоль выбранной ветви решения.
         """
+        self._check_cancelled()
         p0 = np.array(self.ds.guess, dtype=float)
         N = self.ds.continuation_steps
         p = p0.copy()
@@ -1027,6 +1084,7 @@ class BVPSolver:
         failure_message: Optional[str] = None
 
         for step in range(1, N + 1):
+            self._check_cancelled()
             mu = step / N
             target = (1.0 - mu) * Phi_p0
             step_metadata: Dict[str, Any] = {
@@ -1041,8 +1099,11 @@ class BVPSolver:
             }
 
             for _newton_iter in range(20):
+                self._check_cancelled()
                 try:
                     Phi_current = self._Phi(p)
+                except SolveCancelled:
+                    raise
                 except IVPIntegrationError as exc:
                     step_metadata["failure_reason"] = str(exc)
                     solver_metadata["steps"].append(step_metadata)
@@ -1087,6 +1148,8 @@ class BVPSolver:
                         delta = np.linalg.lstsq(dPhi, residual, rcond=None)[0]
                     if not np.isfinite(delta).all():
                         raise ValueError("Newton update contains NaN or Inf")
+                except SolveCancelled:
+                    raise
                 except IVPIntegrationError as exc:
                     step_metadata["jacobian_success"] = False
                     step_metadata["failure_reason"] = str(exc)
@@ -1113,11 +1176,14 @@ class BVPSolver:
 
                 accepted_update = False
                 for factor in (1.0, 0.5, 0.25, 0.125, 0.0625):
+                    self._check_cancelled()
                     p_try = p - factor * delta
                     if not np.isfinite(p_try).all():
                         continue
                     try:
                         Phi_try = self._Phi(p_try)
+                    except SolveCancelled:
+                        raise
                     except IVPIntegrationError as exc:
                         step_metadata["damping_success"] = False
                         step_metadata["failure_reason"] = str(exc)
@@ -1201,6 +1267,7 @@ class BVPSolver:
                     f"{step_metadata['residual_norm']:.4e}",
                 )
 
+        self._check_cancelled()
         algorithm_success = failure_message is None
         result = self._validate_final_candidate(
             p=p,
@@ -1227,6 +1294,7 @@ class BVPSolver:
 
     def solve(self, callback: Optional[Callable] = None) -> dict:
         """Диспетчер: выбирает метод в соответствии с Dataset."""
+        self._check_cancelled()
         errors = self.ds.validate()
         if errors:
             raise ValueError("; ".join(errors))
@@ -1244,31 +1312,81 @@ class BVPSolver:
 class SolverWorker(QThread):
     """
     Поток для выполнения BVP-решения.
-    Сигналы:
-      progress(str, int, str) — метод, прогресс%, сообщение
-      finished(dict)          — результат
-      error(str)              — ошибка
+    Every signal carries the immutable request ID. Numerical failures retain a
+    BVPResult, while programming failures retain a technical traceback.
     """
-    progress = pyqtSignal(str, int, str)
-    finished = pyqtSignal(dict)
-    error = pyqtSignal(str)
+    request_started = pyqtSignal(str)
+    progress = pyqtSignal(str, str, int, str)
+    request_finished = pyqtSignal(str, object)
+    request_failed = pyqtSignal(str, object)
+    request_cancelled = pyqtSignal(str, object)
 
-    def __init__(self, dataset: Dataset):
+    def __init__(
+        self,
+        request: SolveRequest,
+        cancellation_token: Optional[CancellationToken] = None,
+    ):
         super().__init__()
-        self.dataset = dataset
+        self.request = request
+        self.cancellation_token = cancellation_token or CancellationToken()
+
+    def request_cancel(self) -> None:
+        self.cancellation_token.cancel()
 
     def run(self):
+        request_id = self.request.request_id
+        self.request_started.emit(request_id)
         try:
-            parser = SymPyParser(self.dataset.equations, self.dataset.var_names)
+            self.cancellation_token.raise_if_cancelled()
+            dataset = Dataset(**dataset_kwargs(self.request.problem, self.request.config))
+            parser = SymPyParser(dataset.equations, dataset.var_names)
             parser.lambdify_all()
-            solver = BVPSolver(self.dataset, parser)
-            result = solver.solve(callback=self._on_progress)
-            self.finished.emit(result)
-        except Exception as e:
-            self.error.emit(str(e))
+            self.cancellation_token.raise_if_cancelled()
+            solver = BVPSolver(
+                dataset,
+                parser,
+                cancellation_check=self.cancellation_token.raise_if_cancelled,
+            )
+            legacy_result = solver.solve(callback=self._on_progress)
+            self.cancellation_token.raise_if_cancelled()
+            result = BVPResult.from_legacy_dict(legacy_result)
+            if result.success:
+                outcome = SolveOutcome(
+                    request=self.request,
+                    status=SolveOutcomeStatus.COMPLETED,
+                    result=result,
+                    message=result.message,
+                )
+                self.request_finished.emit(request_id, outcome)
+            else:
+                outcome = SolveOutcome(
+                    request=self.request,
+                    status=SolveOutcomeStatus.FAILED,
+                    result=result,
+                    message=result.message,
+                )
+                self.request_failed.emit(request_id, outcome)
+        except SolveCancelled as exc:
+            outcome = SolveOutcome(
+                request=self.request,
+                status=SolveOutcomeStatus.CANCELLED,
+                message=str(exc),
+            )
+            self.request_cancelled.emit(request_id, outcome)
+        except Exception as exc:
+            technical_diagnostic = traceback.format_exc()
+            LOGGER.exception("Solve request %s failed", request_id)
+            outcome = SolveOutcome(
+                request=self.request,
+                status=SolveOutcomeStatus.FAILED,
+                message=f"{type(exc).__name__}: {exc}",
+                technical_diagnostic=technical_diagnostic,
+            )
+            self.request_failed.emit(request_id, outcome)
 
     def _on_progress(self, method: str, percent: int, message: str):
-        self.progress.emit(method, percent, message)
+        self.cancellation_token.raise_if_cancelled()
+        self.progress.emit(self.request.request_id, method, percent, message)
 
 
 # ---------------------------------------------------------------------------
@@ -1312,29 +1430,58 @@ class IntegratedPlotWidget(QWidget):
         },
     }
 
-    def __init__(self, var_names: List[str], all_results: List[dict],
-                 aux_names: List[str] = None, lang: str = "zh", parent=None):
+    def __init__(
+        self,
+        records: List[SolveRecord],
+        lang: str = "zh",
+        parent=None,
+    ):
         super().__init__(parent)
-        self.var_names = var_names
-        self.all_results = all_results
-        self.aux_names = aux_names or []
+        self._set_records(records)
         self.lang = lang
-        self._visible = set(range(len(all_results)))
+        self._visible = set(range(len(records)))
         self._ls_mode = 0
+        self.plot_diagnostics: tuple[str, ...] = ()
         self.setWindowFlags(Qt.Window)
         self.resize(950, 680)
         self._build_ui()
         self._refresh_plot()
 
-    def update_data(self, var_names: List[str], all_results: List[dict],
-                    aux_names: List[str] = None, lang: str = None):
-        """更新数据(当新求解完成时调用)."""
-        self.var_names = var_names
-        self.all_results = all_results
-        self.aux_names = aux_names or []
+    def _set_records(self, records: List[SolveRecord]) -> None:
+        if not records:
+            raise ValueError("plotting requires at least one SolveRecord")
+        _, rejected = partition_plot_records(records, records[-1])
+        if rejected:
+            reasons = "; ".join(
+                f"{record.request_id}: {reason}" for record, reason in rejected
+            )
+            raise ValueError(f"incompatible SolveRecord plot set: {reasons}")
+        self.records = list(records)
+        self.var_names = list(records[0].request.var_names)
+        self.all_results = [record.to_legacy_dict() for record in records]
+        self.aux_names = sorted(
+            {
+                name
+                for record in records
+                for name in record.auxiliary_outputs
+            }
+        )
+
+    def _solution_label(self, index: int) -> str:
+        record = self.records[index]
+        result = record.result
+        return (
+            f"#{index + 1} {record.request.task_name} "
+            f"[{record.request_id[:8]}] ({result.method}, "
+            f"‖Φ‖={result.residual_norm:.2e})"
+        )
+
+    def update_data(self, records: List[SolveRecord], lang: str = None):
+        """Update the plot from provenance-compatible records."""
+        self._set_records(records)
         if lang is not None:
             self.lang = lang
-        self._visible = set(range(len(all_results)))
+        self._visible = set(range(len(records)))
         self._rebuild_controls()
         self._refresh_plot()
 
@@ -1425,8 +1572,7 @@ class IntegratedPlotWidget(QWidget):
                             (214,39,40),(148,103,189),(140,86,75),
                             (227,119,194),(127,127,127)]
         for i, r in enumerate(self.all_results):
-            name = f"#{i+1} ({r['method']}, ‖Φ‖={r['residual_norm']:.2e})"
-            item = QListWidgetItem(name)
+            item = QListWidgetItem(self._solution_label(i))
             item.setCheckState(Qt.Checked)
             item.setData(Qt.UserRole, i)
             c = self._colors_rgb[i % len(self._colors_rgb)]
@@ -1447,6 +1593,10 @@ class IntegratedPlotWidget(QWidget):
         right.addWidget(self.canvas)
         self.toolbar = NavigationToolbar(self.canvas, self)
         right.addWidget(self.toolbar)
+        self.diagnostic_label = QLabel("")
+        self.diagnostic_label.setWordWrap(True)
+        self.diagnostic_label.setStyleSheet("color: #c0392b; font-size: 11px;")
+        right.addWidget(self.diagnostic_label)
         main_layout.addLayout(right, 1)
 
     def _populate_y_list(self):
@@ -1481,8 +1631,7 @@ class IntegratedPlotWidget(QWidget):
 
         self.sol_list.clear()
         for i, r in enumerate(self.all_results):
-            name = f"#{i+1} ({r['method']}, ‖Φ‖={r['residual_norm']:.2e})"
-            item = QListWidgetItem(name)
+            item = QListWidgetItem(self._solution_label(i))
             item.setCheckState(Qt.Checked)
             item.setData(Qt.UserRole, i)
             c = self._colors_rgb[i % len(self._colors_rgb)]
@@ -1543,6 +1692,7 @@ class IntegratedPlotWidget(QWidget):
         # 收集数据（状态变量 + 辅助变量）
         aux_set = set(self.aux_names)
         curves = []
+        diagnostics: list[str] = []
         for i, r in enumerate(self.all_results):
             if i not in self._visible:
                 continue
@@ -1559,21 +1709,36 @@ class IntegratedPlotWidget(QWidget):
                 # 辅助变量数据
                 aux_data = r.get("aux", {})
                 for y_name in y_axes:
-                    try:
-                        if y_name in aux_set:
-                            # 辅助变量: 从预计算数据中取
-                            aux_vals = aux_data.get(y_name)
-                            if aux_vals is not None:
-                                curves.append((i, y_name, np.asarray(xd), np.asarray(aux_vals)))
-                        else:
-                            yd_arr, yl = axis_data(y_name, td, yd)
-                            curves.append((i, y_name, np.asarray(xd), np.asarray(yd_arr)))
-                    except Exception:
-                        continue
-            except Exception:
-                continue
+                    if y_name in aux_set:
+                        aux_vals = aux_data.get(y_name)
+                        if aux_vals is None:
+                            diagnostics.append(
+                                f"request {r['request_id']}: auxiliary {y_name!r} "
+                                "is unavailable"
+                            )
+                            continue
+                        curves.append(
+                            (i, y_name, np.asarray(xd), np.asarray(aux_vals))
+                        )
+                    else:
+                        yd_arr, yl = axis_data(y_name, td, yd)
+                        curves.append(
+                            (i, y_name, np.asarray(xd), np.asarray(yd_arr))
+                        )
+            except (KeyError, ValueError, TypeError, IndexError, AttributeError) as exc:
+                diagnostics.append(
+                    f"request {r.get('request_id', 'unknown')}: "
+                    f"{type(exc).__name__}: {exc}"
+                )
+
+        self.plot_diagnostics = tuple(diagnostics)
+        self.diagnostic_label.setText("\n".join(diagnostics))
+        for diagnostic in diagnostics:
+            LOGGER.warning("Plot diagnostic: %s", diagnostic)
 
         if not curves:
+            if not diagnostics:
+                self.diagnostic_label.setText("No compatible plot curves are available.")
             return
 
         # 重绘
@@ -1928,7 +2093,8 @@ class BvpSolverApp(QMainWindow):
             "tab_params": "参数与方法",
             "progress_title": "求解进度",
             # 按钮
-            "btn_solve": "求解", "btn_plot": "绘图",
+            "btn_solve": "求解", "btn_cancel": "取消",
+            "btn_plot": "绘图",
             "btn_export": "导出", "btn_clear": "清空",
 
             # 参数标签
@@ -1944,11 +2110,13 @@ class BvpSolverApp(QMainWindow):
             # 状态
             "status_ready": "就绪",
             "status_solving": "正在求解...",
+            "status_cancel_requested": "正在取消...",
+            "status_cancelled": "已取消",
             "status_solved": "求解完成!",
             "status_error": "求解失败",
             "status_saved": "已保存: {name}",
             "err_no_solution": "无可用的解，请先求解。",
-            "confirm_clear": "确定要清空所有数据?",
+            "confirm_clear": "确定要清空结果历史和绘图吗?",
             "solve_success": "求解成功!\n\n方法: {method}\n"
                              "迭代次数: {iter}\n"
                              "残差范数: {res_norm:.4e}\n"
@@ -2015,7 +2183,8 @@ class BvpSolverApp(QMainWindow):
             "tab_params": "Параметры и метод",
             "progress_title": "Progress",
             # Кнопки
-            "btn_solve": "Решить", "btn_plot": "График",
+            "btn_solve": "Решить", "btn_cancel": "Отмена",
+            "btn_plot": "График",
             "btn_export": "Экспорт", "btn_clear": "Очистить",
 
             "param_T": "Время T:",
@@ -2028,11 +2197,13 @@ class BvpSolverApp(QMainWindow):
             "solver_shoot": "Стрельба / Shooting",
             "status_ready": "Готово",
             "status_solving": "Решаю...",
+            "status_cancel_requested": "Отмена запрошена...",
+            "status_cancelled": "Отменено",
             "status_solved": "Решение найдено!",
             "status_error": "Ошибка",
             "status_saved": "Сохранено: {name}",
             "err_no_solution": "Нет решения. Сначала нажмите 'Решить'.",
-            "confirm_clear": "Очистить все данные?",
+            "confirm_clear": "Очистить историю результатов и график?",
             "solve_success": "Решение найдено!\n\nМетод: {method}\n"
                              "Итераций: {iter}\n"
                              "‖Φ‖: {res_norm:.4e}\n"
@@ -2052,14 +2223,25 @@ class BvpSolverApp(QMainWindow):
 
         # ---- Библиотека задач -------------------------------------------
         self.tasks: List[Dataset] = []          # все задачи
+        self._task_ids: List[str] = []          # stable GUI identities
         self.current_task_idx: int = -1          # текущая выбранная
         self._suppress_sync: bool = False       # флаг блокировки синхронизации
 
-        # Хранение результатов
-        self.last_result: Optional[dict] = None
-        self.last_failed_result: Optional[dict] = None
-        self.all_results: List[dict] = []
-        self._task_status: Dict[int, str] = {}  # task_idx -> "solved" | "error"
+        # Request lifecycle and provenance-backed result history.
+        self.solve_records: List[SolveRecord] = []
+        self.last_record: Optional[SolveRecord] = None
+        self.last_failed_record: Optional[SolveOutcome] = None
+        self.last_cancelled_outcome: Optional[SolveOutcome] = None
+        self.solve_state = GuiSolveState.IDLE
+        self.active_request_id: Optional[str] = None
+        self.active_worker: Optional[SolverWorker] = None
+        self.active_cancellation_token: Optional[CancellationToken] = None
+        self._processed_request_ids: set[str] = set()
+        self._last_signal_diagnostic = ""
+        self._closing = False
+        self.close_wait_timeout_ms = 2000
+        self.worker_factory = SolverWorker
+        self._task_status: Dict[str, str] = {}
 
         self.init_ui()
         # Загружаем встроенные примеры как задачи
@@ -2067,10 +2249,46 @@ class BvpSolverApp(QMainWindow):
         self._refresh_task_table()
         self.update_language(self.current_lang)
         self.apply_theme()
+        self._render_gui_state()
+
+    @property
+    def all_results(self) -> List[dict]:
+        """Legacy boundary view; SolveRecord remains the history source of truth."""
+        return [record.to_legacy_dict() for record in self.solve_records]
+
+    @property
+    def last_result(self) -> Optional[dict]:
+        return None if self.last_record is None else self.last_record.to_legacy_dict()
+
+    @property
+    def last_failed_result(self) -> Optional[dict]:
+        outcome = self.last_failed_record
+        if outcome is None or outcome.result is None:
+            return None
+        return outcome.result.to_dict()
 
     def _load_builtin_tasks(self):
         """Built-in examples removed. User imports via Load button."""
         pass
+
+    def _ensure_task_ids(self) -> None:
+        while len(self._task_ids) < len(self.tasks):
+            self._task_ids.append(uuid4().hex)
+        if len(self._task_ids) > len(self.tasks):
+            del self._task_ids[len(self.tasks):]
+
+    def _task_id_for_index(self, index: int) -> Optional[str]:
+        self._ensure_task_ids()
+        if 0 <= index < len(self._task_ids):
+            return self._task_ids[index]
+        return None
+
+    def _task_index_for_id(self, task_id: str) -> Optional[int]:
+        self._ensure_task_ids()
+        try:
+            return self._task_ids.index(task_id)
+        except ValueError:
+            return None
 
     # ------------------------------------------------------------------
     # Управление библиотекой задач
@@ -2078,6 +2296,7 @@ class BvpSolverApp(QMainWindow):
 
     def _refresh_task_table(self):
         """Обновляет таблицу задач."""
+        self._ensure_task_ids()
         self.task_table.setRowCount(len(self.tasks))
         for i, ds in enumerate(self.tasks):
             # Номер
@@ -2089,11 +2308,13 @@ class BvpSolverApp(QMainWindow):
             item_name.setFlags(item_name.flags() & ~Qt.ItemIsEditable)
             self.task_table.setItem(i, 1, item_name)
             # Статус
-            st = self._task_status.get(i, "")
+            st = self._task_status.get(self._task_ids[i], "")
             if st == "solved":
                 status_text = "✓"
             elif st == "error":
                 status_text = "✗"
+            elif st == "cancelled":
+                status_text = "–"
             else:
                 status_text = ""
             item_status = QTableWidgetItem(status_text)
@@ -2104,6 +2325,9 @@ class BvpSolverApp(QMainWindow):
             elif st == "error":
                 item_status.setBackground(QColor(231, 76, 60, 60))
                 item_status.setForeground(QColor(231, 76, 60))
+            elif st == "cancelled":
+                item_status.setBackground(QColor(127, 140, 141, 50))
+                item_status.setForeground(QColor(127, 140, 141))
             self.task_table.setItem(i, 2, item_status)
 
     def _on_task_selected(self):
@@ -2256,6 +2480,7 @@ class BvpSolverApp(QMainWindow):
             unknown_indices=[0, 1],
         )
         self.tasks.append(ds)
+        self._task_ids.append(uuid4().hex)
         self._refresh_task_table()
         # Выбираем новую задачу
         self.task_table.selectRow(len(self.tasks) - 1)
@@ -2269,7 +2494,11 @@ class BvpSolverApp(QMainWindow):
             QMessageBox.Yes | QMessageBox.No
         )
         if reply == QMessageBox.Yes:
+            task_id = self._task_id_for_index(self.current_task_idx)
             self.tasks.pop(self.current_task_idx)
+            self._task_ids.pop(self.current_task_idx)
+            if task_id is not None:
+                self._task_status.pop(task_id, None)
             self.current_task_idx = -1
             self._refresh_task_table()
             self.input_task_name.setText("")
@@ -2298,8 +2527,10 @@ class BvpSolverApp(QMainWindow):
             if isinstance(data, list):
                 for item in data:
                     self.tasks.append(Dataset.from_dict(item))
+                    self._task_ids.append(uuid4().hex)
             elif isinstance(data, dict):
                 self.tasks.append(Dataset.from_dict(data))
+                self._task_ids.append(uuid4().hex)
             self._refresh_task_table()
             self.progress_detail.setText(f"已加载 {len(self.tasks)} 个任务")
         except Exception as e:
@@ -2482,6 +2713,9 @@ class BvpSolverApp(QMainWindow):
         self.btn_solve = QPushButton()
         self.btn_solve.setMinimumWidth(100)
         self.btn_solve.clicked.connect(self.on_solve)
+        self.btn_cancel = QPushButton()
+        self.btn_cancel.setMinimumWidth(100)
+        self.btn_cancel.clicked.connect(self.on_cancel)
         self.btn_plot = QPushButton()
         self.btn_plot.setMinimumWidth(100)
         self.btn_plot.clicked.connect(self.on_plot)
@@ -2492,6 +2726,7 @@ class BvpSolverApp(QMainWindow):
         self.btn_clear.setMinimumWidth(100)
         self.btn_clear.clicked.connect(self.on_clear)
         btn_layout.addWidget(self.btn_solve)
+        btn_layout.addWidget(self.btn_cancel)
         btn_layout.addWidget(self.btn_plot)
         btn_layout.addWidget(self.btn_export)
         btn_layout.addWidget(self.btn_clear)
@@ -2647,93 +2882,312 @@ class BvpSolverApp(QMainWindow):
     # Решение
     # ------------------------------------------------------------------
 
-    def on_solve(self):
+    def _set_gui_state(
+        self, state: GuiSolveState, detail: Optional[str] = None
+    ) -> None:
+        if not gui_transition_allowed(self.solve_state, state):
+            raise RuntimeError(
+                f"Invalid GUI solve transition: {self.solve_state.value} -> "
+                f"{state.value}"
+            )
+        self.solve_state = state
+        if detail is not None:
+            self.progress_detail.setText(detail)
+        self._render_gui_state()
+
+    def _render_gui_state(self) -> None:
+        if not hasattr(self, "btn_solve"):
+            return
         t = self.TRANSLATIONS[self.current_lang]
-        self.btn_solve.setEnabled(False)
-        # 重置进度标签样式（清除之前的绿色）
-        self.progress_bar_label.setStyleSheet("")
-        self.progress_bar_label.setText(t["status_solving"])
+        active = self.solve_state in {
+            GuiSolveState.RUNNING,
+            GuiSolveState.CANCEL_REQUESTED,
+        }
+        self.btn_solve.setEnabled(not active)
+        self.btn_cancel.setEnabled(self.solve_state is GuiSolveState.RUNNING)
+        self.btn_plot.setEnabled(bool(self.solve_records))
+        self.btn_export.setEnabled(self.last_record is not None)
+        self.btn_clear.setEnabled(
+            bool(
+                self.solve_records
+                or self.last_failed_record
+                or self.last_cancelled_outcome
+            )
+        )
+
+        # Task viewing and editing remain available because active requests are
+        # immutable snapshots. Their availability is still centralized here.
+        for widget in (
+            self.btn_task_add,
+            self.btn_task_delete,
+            self.btn_task_load,
+            self.btn_task_save,
+            self.btn_task_save_current,
+            self.task_table,
+            self.eq_editor,
+        ):
+            widget.setEnabled(True)
+
+        status_key = {
+            GuiSolveState.IDLE: "status_ready",
+            GuiSolveState.RUNNING: "status_solving",
+            GuiSolveState.CANCEL_REQUESTED: "status_cancel_requested",
+            GuiSolveState.COMPLETED: "status_solved",
+            GuiSolveState.FAILED: "status_error",
+            GuiSolveState.CANCELLED: "status_cancelled",
+        }[self.solve_state]
+        self.progress_bar_label.setText(t[status_key])
+        if self.solve_state is GuiSolveState.COMPLETED:
+            style = "background-color: #27ae60; color: white;"
+        elif self.solve_state is GuiSolveState.FAILED:
+            style = "background-color: #e74c3c; color: white;"
+        elif self.solve_state is GuiSolveState.CANCEL_REQUESTED:
+            style = "background-color: #f39c12; color: white;"
+        elif self.solve_state is GuiSolveState.CANCELLED:
+            style = "background-color: #7f8c8d; color: white;"
+        else:
+            style = ""
+        if style:
+            style += " padding: 4px 8px; border-radius: 4px; font-weight: bold;"
+        self.progress_bar_label.setStyleSheet(style)
+
+    def _build_solve_request(self) -> SolveRequest:
+        dataset = self._build_dataset()
+        errors = dataset.validate()
+        if errors:
+            raise ValueError("\n".join(errors))
+        problem = problem_from_dataset(dataset)
+        config = config_from_dataset(dataset)
+        source_index = (
+            self.current_task_idx
+            if 0 <= self.current_task_idx < len(self.tasks)
+            else None
+        )
+        source_task_id = (
+            self._task_id_for_index(source_index)
+            if source_index is not None
+            else f"unsaved-{uuid4().hex}"
+        )
+        return SolveRequest.create(
+            problem=problem,
+            config=config,
+            source_task_id=source_task_id,
+            source_task_index=source_index,
+            display_metadata={"language": self.current_lang},
+        )
+
+    def on_solve(self) -> bool:
+        if self.solve_state in {
+            GuiSolveState.RUNNING,
+            GuiSolveState.CANCEL_REQUESTED,
+        } or (self.active_worker is not None and self.active_worker.isRunning()):
+            self._last_signal_diagnostic = (
+                "A solve request is already active; a second worker was not started."
+            )
+            self.progress_detail.setText(self._last_signal_diagnostic)
+            LOGGER.info(self._last_signal_diagnostic)
+            return False
 
         try:
-            dataset = self._build_dataset()
-            errors = dataset.validate()
-            if errors:
-                QMessageBox.warning(self, "Validation Error", "\n".join(errors))
-                self.btn_solve.setEnabled(True)
-                self.progress_bar_label.setText(t["status_ready"])
-                return
-        except Exception as e:
-            QMessageBox.critical(self, "Error", str(e))
-            self.btn_solve.setEnabled(True)
+            request = self._build_solve_request()
+        except Exception as exc:
+            QMessageBox.warning(self, "Validation Error", str(exc))
+            self.progress_detail.setText(str(exc))
+            self._render_gui_state()
+            return False
+        return self._start_solve_request(request)
+
+    def _start_solve_request(self, request: SolveRequest) -> bool:
+        if self.active_worker is not None and self.active_worker.isRunning():
+            return False
+        token = CancellationToken()
+        worker = self.worker_factory(request, token)
+        worker.request_started.connect(self._on_request_started)
+        worker.progress.connect(self._on_progress)
+        worker.request_finished.connect(self._on_solve_done)
+        worker.request_failed.connect(self._on_solve_error)
+        worker.request_cancelled.connect(self._on_solve_cancelled)
+        worker.finished.connect(
+            lambda request_id=request.request_id, target=worker:
+            self._on_worker_thread_finished(request_id, target)
+        )
+        self.active_request_id = request.request_id
+        self.active_cancellation_token = token
+        self.active_worker = worker
+        self._set_gui_state(
+            GuiSolveState.RUNNING,
+            f"request_id={request.request_id} task={request.task_name}",
+        )
+        LOGGER.info("Solve request %s started for %s", request.request_id, request.task_name)
+        worker.start()
+        return True
+
+    def on_cancel(self) -> bool:
+        if (
+            self.solve_state is not GuiSolveState.RUNNING
+            or self.active_request_id is None
+            or self.active_cancellation_token is None
+        ):
+            return False
+        request_id = self.active_request_id
+        self.active_cancellation_token.cancel()
+        self._set_gui_state(
+            GuiSolveState.CANCEL_REQUESTED,
+            f"Cancellation requested for {request_id}; waiting for a checkpoint.",
+        )
+        LOGGER.info("Cancellation requested for solve %s", request_id)
+        return True
+
+    def _on_request_started(self, request_id: str) -> None:
+        LOGGER.info("Worker acknowledged solve request %s", request_id)
+
+    def _on_progress(
+        self, request_id: str, method: str, percent: int, message: str
+    ) -> None:
+        if request_id != self.active_request_id or self._closing:
+            LOGGER.info("Ignored stale progress signal for request %s", request_id)
             return
-
-        self.worker = SolverWorker(dataset)
-        self.worker.progress.connect(self._on_progress)
-        self.worker.finished.connect(self._on_solve_done)
-        self.worker.error.connect(self._on_solve_error)
-        self.worker.start()
-
-    def _on_progress(self, method: str, percent: int, message: str):
         self.progress_bar_label.setText(f"[{percent}%] {method}")
         self.progress_detail.setText(message)
 
-    def _on_solve_done(self, result: dict):
-        t = self.TRANSLATIONS[self.current_lang]
-        self.btn_solve.setEnabled(True)
-
-        if not is_result_acceptable(result):
-            self.last_result = None
-            self.last_failed_result = result
-            self.progress_bar_label.setStyleSheet(
-                "background-color: #e74c3c; color: white; "
-                "padding: 4px 8px; border-radius: 4px; font-weight: bold;"
+    def _accept_terminal_signal(self, request_id: str) -> bool:
+        if request_id in self._processed_request_ids:
+            self._last_signal_diagnostic = (
+                f"Ignored duplicate terminal signal for request {request_id}."
             )
-            self.progress_bar_label.setText(t["status_error"])
-            diagnostic = self._format_failed_result(result)
-            self.progress_detail.setText(diagnostic)
-            if self.current_task_idx >= 0:
-                self._task_status[self.current_task_idx] = "error"
-                self._refresh_task_table()
-            QMessageBox.warning(self, "BVP result rejected", diagnostic)
+            LOGGER.warning(self._last_signal_diagnostic)
+            return False
+        if request_id != self.active_request_id:
+            self._processed_request_ids.add(request_id)
+            self._last_signal_diagnostic = (
+                f"Ignored stale terminal signal for request {request_id}; "
+                f"active_request_id={self.active_request_id}."
+            )
+            LOGGER.warning(self._last_signal_diagnostic)
+            return False
+        self._processed_request_ids.add(request_id)
+        return True
+
+    def _release_active_request(self, request_id: str) -> None:
+        if self.active_request_id == request_id:
+            self.active_request_id = None
+            self.active_cancellation_token = None
+
+    def _set_request_task_status(self, request: SolveRequest, status: str) -> None:
+        if self._task_index_for_id(request.source_task_id) is None:
+            return
+        self._task_status[request.source_task_id] = status
+        self._refresh_task_table()
+
+    def _on_solve_done(self, request_id: str, outcome: SolveOutcome) -> None:
+        if self._closing or not self._accept_terminal_signal(request_id):
+            return
+        if (
+            outcome.request_id != request_id
+            or outcome.status is not SolveOutcomeStatus.COMPLETED
+            or outcome.result is None
+        ):
+            raise RuntimeError("Worker emitted an invalid completed outcome")
+
+        if (
+            self.active_cancellation_token is not None
+            and self.active_cancellation_token.is_cancelled()
+        ):
+            cancelled = SolveOutcome(
+                request=outcome.request,
+                status=SolveOutcomeStatus.CANCELLED,
+                message="Cancellation was observed before auxiliary output processing.",
+            )
+            self.last_cancelled_outcome = cancelled
+            self._set_request_task_status(outcome.request, "cancelled")
+            self._release_active_request(request_id)
+            self._set_gui_state(
+                GuiSolveState.CANCELLED,
+                f"request_id={request_id}: {cancelled.message}",
+            )
             return
 
-        # --- 计算辅助输出变量 ---
-        result = self._compute_aux_outputs(result)
-
-        self.last_failed_result = None
-        self.last_result = result
-        self.all_results.append(result)
-
-        # --- 构建完整的 x(0) 状态向量 ---
-        full_state = self._build_full_state(result["p_opt"])
-        full_str = np.array2string(full_state, precision=6, separator=", ")
-
-        p_opt_str = np.array2string(
-            result["p_opt"], precision=6, separator=", "
+        aux_data, aux_t, aux_errors = self._compute_aux_outputs(
+            outcome.request, outcome.result
         )
-        msg = t["solve_success"].format(
-            method=result["method"],
-            iter=result["iterations"],
-            res_norm=result["residual_norm"],
+        record = SolveRecord(
+            request=outcome.request,
+            result=outcome.result,
+            auxiliary_outputs=aux_data,
+            auxiliary_sample_t=aux_t,
+            auxiliary_errors=aux_errors,
+            completed_at=outcome.completed_at,
+        )
+        self.solve_records.append(record)
+        self.last_record = record
+        self._set_request_task_status(outcome.request, "solved")
+        self._release_active_request(request_id)
+
+        result = outcome.result
+        full_state = outcome.request.build_initial_state(result.p_opt)
+        full_str = np.array2string(full_state, precision=6, separator=", ")
+        p_opt_str = np.array2string(result.p_opt, precision=6, separator=", ")
+        message = self.TRANSLATIONS[self.current_lang]["solve_success"].format(
+            method=result.method,
+            iter=result.iterations,
+            res_norm=result.residual_norm,
             p_opt=p_opt_str,
             full_state=full_str,
         )
-        # 求解成功 — 进度标签变绿色，表格状态列标记 ✓
-        self.progress_bar_label.setStyleSheet(
-            "background-color: #27ae60; color: white; "
-            "padding: 4px 8px; border-radius: 4px; font-weight: bold;"
+        detail = f"‖Φ‖ = {result.residual_norm:.4e}; request_id={request_id}"
+        if aux_errors:
+            detail += "; auxiliary warnings: " + " | ".join(aux_errors)
+        self._set_gui_state(GuiSolveState.COMPLETED, detail)
+        LOGGER.info("Solve request %s completed", request_id)
+        QMessageBox.information(self, "Result", message)
+
+    def _on_solve_error(self, request_id: str, outcome: SolveOutcome) -> None:
+        if self._closing or not self._accept_terminal_signal(request_id):
+            return
+        if outcome.request_id != request_id or outcome.status is not SolveOutcomeStatus.FAILED:
+            raise RuntimeError("Worker emitted an invalid failed outcome")
+        self.last_failed_record = outcome
+        self._set_request_task_status(outcome.request, "error")
+        self._release_active_request(request_id)
+        if outcome.result is not None:
+            diagnostic = self._format_failed_result(outcome.result)
+            QMessageBox.warning(self, "BVP result rejected", diagnostic)
+        else:
+            diagnostic = outcome.message
+            QMessageBox.critical(self, "Solve error", diagnostic)
+        if outcome.technical_diagnostic:
+            LOGGER.error(
+                "Technical diagnostic for request %s:\n%s",
+                request_id,
+                outcome.technical_diagnostic,
+            )
+        self._set_gui_state(GuiSolveState.FAILED, diagnostic)
+
+    def _on_solve_cancelled(self, request_id: str, outcome: SolveOutcome) -> None:
+        if self._closing or not self._accept_terminal_signal(request_id):
+            return
+        if outcome.request_id != request_id or outcome.status is not SolveOutcomeStatus.CANCELLED:
+            raise RuntimeError("Worker emitted an invalid cancelled outcome")
+        self.last_cancelled_outcome = outcome
+        self._set_request_task_status(outcome.request, "cancelled")
+        self._release_active_request(request_id)
+        self._set_gui_state(
+            GuiSolveState.CANCELLED,
+            f"request_id={request_id}: {outcome.message}",
         )
-        self.progress_bar_label.setText(t["status_solved"])
-        self.progress_detail.setText(
-            f"‖Φ‖ = {result['residual_norm']:.4e}"
-        )
-        if self.current_task_idx >= 0:
-            self._task_status[self.current_task_idx] = "solved"
-            self._refresh_task_table()
-        QMessageBox.information(self, "Result", msg)
+        LOGGER.info("Solve request %s cancelled", request_id)
+
+    def _on_worker_thread_finished(
+        self, request_id: str, worker: SolverWorker
+    ) -> None:
+        LOGGER.info("Worker thread finished for request %s", request_id)
+        if self.active_worker is worker:
+            self.active_worker = None
 
     @staticmethod
-    def _format_failed_result(result: dict) -> str:
+    def _format_failed_result(result: BVPResult | dict) -> str:
+        if isinstance(result, BVPResult):
+            result = result.to_dict()
         residual = np.asarray(result.get("boundary_residual", []), dtype=float)
         residual_text = np.array2string(residual, precision=6, separator=", ")
         residual_norm = result.get("boundary_residual_norm", float("inf"))
@@ -2764,100 +3218,104 @@ class BvpSolverApp(QMainWindow):
             f"solver_metadata: {metadata_summary}"
         )
 
-    def _build_full_state(self, p_opt: np.ndarray) -> np.ndarray:
-        """从 p_opt 和 known 值构建完整的 x(0) 状态向量."""
-        if self.current_task_idx < 0 or self.current_task_idx >= len(self.tasks):
-            return p_opt
-        ds = self.tasks[self.current_task_idx]
-        n = ds.dim()
-        state = np.zeros(n)
-        # 填入 known 值
-        for idx in ds.known_indices:
-            val = ds.initial_values.get(idx)
-            if val is not None:
-                state[idx] = float(val)
-        # 填入 unknown 值 (p_opt)
-        for i, idx in enumerate(ds.unknown_indices):
-            if i < len(p_opt):
-                state[idx] = p_opt[i]
-        return state
+    @staticmethod
+    def _build_full_state(
+        request: SolveRequest, p_opt: np.ndarray
+    ) -> np.ndarray:
+        """Build x(t_start) exclusively from the originating request."""
+        return request.build_initial_state(p_opt)
 
-    def _compute_aux_outputs(self, result: dict) -> dict:
-        """计算辅助输出变量并存储在结果中.
-        
-        对于 26.4 (lunula): u1/u2 从 ODE 方程反推,
-        自动跟随方程中的 mu 值(用户可能修改了 mu).
-        dx0/dt = T*(x1+u1) -> u1 = dx0/dt/T - x1
-        dx1/dt = T*(-1.5*x0-0.25*x1+u2) -> u2 = dx1/dt/T + 1.5*x0 + 0.25*x1
+    def _compute_aux_outputs(
+        self, request: SolveRequest, result: BVPResult
+    ) -> tuple[dict[str, np.ndarray], np.ndarray, tuple[str, ...]]:
+        """Compute auxiliary outputs exclusively from the request snapshot.
+
+        Each expression failure is retained as a diagnostic. A valid primary
+        solution is never discarded because one auxiliary expression failed.
         """
-        if self.current_task_idx < 0 or self.current_task_idx >= len(self.tasks):
-            return result
-        ds = self.tasks[self.current_task_idx]
+        problem = request.problem
+        has_lunula_outputs = (
+            "26.4" in problem.name or "Лунка" in problem.name
+        ) and len(problem.var_names) >= 5
+        if not problem.auxiliary_expressions and not has_lunula_outputs:
+            return {}, np.array([], dtype=float), ()
+
+        errors: list[str] = []
         try:
-            parser = SymPyParser(ds.equations, ds.var_names)
+            parser = SymPyParser(list(problem.odes), list(problem.var_names))
             parser.parse()
             parser.lambdify_all()
-
-            sol = result["sol"]
+            sol = result.sol
+            if sol is None:
+                raise ValueError("dense IVP solution is unavailable")
             t0, t1 = float(sol.t[0]), float(sol.t[-1])
             td = np.linspace(t0, t1, 500)
-            if hasattr(sol, 'sol') and callable(sol.sol):
+            if hasattr(sol, "sol") and callable(sol.sol):
                 yd = sol.sol(td)
             else:
-                yd = np.array([np.interp(td, sol.t, sol.y[j])
-                               for j in range(len(ds.var_names))])
+                yd = np.array(
+                    [
+                        np.interp(td, sol.t, sol.y[j])
+                        for j in range(len(problem.var_names))
+                    ]
+                )
+        except Exception as exc:
+            diagnostic = (
+                "auxiliary setup failed for request "
+                f"{request.request_id}: {type(exc).__name__}: {exc}"
+            )
+            LOGGER.warning(diagnostic)
+            return {}, np.array([], dtype=float), (diagnostic,)
 
-            aux_data = {}
-            aux_names = []
-
-            # --- 26.4 lunula: 从 ODE 反推 u1, u2 ---
-            is_lunula = ("26.4" in ds.name or "Лунка" in ds.name)
-            if is_lunula and len(ds.var_names) >= 5:
-                u1_vals = []
-                u2_vals = []
-                for i, t in enumerate(td):
-                    f_vals = parser.f(t, yd[:, i])
-                    T = yd[4, i]  # x4 = T
-                    if abs(T) > 1e-12:
-                        u1 = f_vals[0] / T - yd[1, i]
-                        u2 = f_vals[1] / T + 1.5 * yd[0, i] + 0.25 * yd[1, i]
+        aux_data: dict[str, np.ndarray] = {}
+        if has_lunula_outputs:
+            try:
+                u1_values = []
+                u2_values = []
+                for index, time_value in enumerate(td):
+                    f_values = parser.f(time_value, yd[:, index])
+                    time_scale = yd[4, index]
+                    if abs(time_scale) > 1e-12:
+                        u1 = f_values[0] / time_scale - yd[1, index]
+                        u2 = (
+                            f_values[1] / time_scale
+                            + 1.5 * yd[0, index]
+                            + 0.25 * yd[1, index]
+                        )
                     else:
                         u1 = u2 = 0.0
-                    u1_vals.append(u1)
-                    u2_vals.append(u2)
-                aux_data["u1"] = np.array(u1_vals)
-                aux_data["u2"] = np.array(u2_vals)
-                aux_names.extend(["u1", "u2"])
+                    u1_values.append(u1)
+                    u2_values.append(u2)
+                aux_data["u1"] = np.asarray(u1_values, dtype=float)
+                aux_data["u2"] = np.asarray(u2_values, dtype=float)
+            except Exception as exc:
+                diagnostic = f"auxiliary 'u1/u2' failed: {type(exc).__name__}: {exc}"
+                errors.append(diagnostic)
+                LOGGER.warning("Request %s: %s", request.request_id, diagnostic)
 
-            # --- 一般 aux_outputs ---
-            if ds.aux_outputs:
-                aux_fns = parser.lambdify_aux(ds.aux_outputs)
-                for name, fn in aux_fns.items():
-                    if name not in aux_data:  # 不覆盖 lunula 反推
-                        vals = np.array([fn(t, *yd[:, i]) for i, t in enumerate(td)])
-                        aux_data[name] = vals
-                        aux_names.append(name)
+        for name, expression in problem.auxiliary_expressions.items():
+            if name in aux_data:
+                continue
+            try:
+                function = parser.lambdify_aux({name: expression})[name]
+                values = np.array(
+                    [
+                        function(time_value, *yd[:, index])
+                        for index, time_value in enumerate(td)
+                    ],
+                    dtype=float,
+                ).reshape(-1)
+                if values.size != td.size or not np.isfinite(values).all():
+                    raise ValueError("values are non-finite or have an invalid shape")
+                aux_data[name] = values
+            except Exception as exc:
+                diagnostic = (
+                    f"auxiliary {name!r} failed: {type(exc).__name__}: {exc}"
+                )
+                errors.append(diagnostic)
+                LOGGER.warning("Request %s: %s", request.request_id, diagnostic)
 
-            if aux_data:
-                result["aux"] = aux_data
-                result["aux_names"] = aux_names
-        except Exception:
-            pass
-        return result
-
-    def _on_solve_error(self, msg: str):
-        t = self.TRANSLATIONS[self.current_lang]
-        self.btn_solve.setEnabled(True)
-        self.progress_bar_label.setStyleSheet(
-            "background-color: #e74c3c; color: white; "
-            "padding: 4px 8px; border-radius: 4px; font-weight: bold;"
-        )
-        self.progress_bar_label.setText(t["status_error"])
-        self.progress_detail.setText(msg[:200])
-        if self.current_task_idx >= 0:
-            self._task_status[self.current_task_idx] = "error"
-            self._refresh_task_table()
-        QMessageBox.critical(self, "Error", msg)
+        return aux_data, td, tuple(errors)
 
     # ------------------------------------------------------------------
     # Построение графиков
@@ -2865,29 +3323,38 @@ class BvpSolverApp(QMainWindow):
 
     def on_plot(self):
         t = self.TRANSLATIONS[self.current_lang]
-        valid_results = [
-            result for result in self.all_results if is_result_acceptable(result)
-        ]
-        if not valid_results:
+        if not self.solve_records or self.last_record is None:
             QMessageBox.warning(self, "Warning", t["err_no_solution"])
             return
 
-        var_names = self.eq_editor.get_var_names()
-        # 收集所有辅助变量名（去重）
-        aux_names_set = set()
-        for r in valid_results:
-            aux_names_set.update(r.get("aux_names", []))
-        aux_names = sorted(aux_names_set)
+        compatible_records, rejected = partition_plot_records(
+            self.solve_records, self.last_record
+        )
+        if rejected:
+            summary = "; ".join(
+                f"{record.request.task_name}[{record.request_id[:8]}]: {reason}"
+                for record, reason in rejected
+            )
+            diagnostic = (
+                f"Plot isolation kept {len(compatible_records)} compatible "
+                f"record(s) and excluded {len(rejected)}: {summary}"
+            )
+            self.progress_detail.setText(diagnostic)
+            LOGGER.warning(diagnostic)
         if hasattr(self, '_plot_widget') and self._plot_widget is not None:
             try:
-                self._plot_widget.update_data(var_names, valid_results, aux_names, lang=self.current_lang)
+                self._plot_widget.update_data(
+                    list(compatible_records), lang=self.current_lang
+                )
                 self._plot_widget.show()
                 self._plot_widget.raise_()
                 self._plot_widget.activateWindow()
                 return
             except RuntimeError:
                 self._plot_widget = None
-        self._plot_widget = IntegratedPlotWidget(var_names, valid_results, aux_names, lang=self.current_lang, parent=self)
+        self._plot_widget = IntegratedPlotWidget(
+            list(compatible_records), lang=self.current_lang, parent=self
+        )
         self._plot_widget.show()
         self._plot_widget.raise_()
         self._plot_widget.activateWindow()
@@ -2926,6 +3393,7 @@ class BvpSolverApp(QMainWindow):
         # ---- 1. Собираем данные ----
         # curves: (sol_idx, y_var_name, x_arr, y_arr)
         curves = []
+        plot_diagnostics = []
         for i, r in enumerate(all_results):
             if i not in visible:
                 continue
@@ -2943,10 +3411,20 @@ class BvpSolverApp(QMainWindow):
                     try:
                         yd_arr, yl = axis_data(y_name, td, yd)
                         curves.append((i, y_name, np.asarray(xd), np.asarray(yd_arr)))
-                    except Exception:
-                        continue
-            except Exception:
-                continue
+                    except (ValueError, IndexError, TypeError) as exc:
+                        plot_diagnostics.append(
+                            f"solution {i + 1}, axis {y_name!r}: "
+                            f"{type(exc).__name__}: {exc}"
+                        )
+            except (KeyError, ValueError, IndexError, TypeError, AttributeError) as exc:
+                plot_diagnostics.append(
+                    f"solution {i + 1}: {type(exc).__name__}: {exc}"
+                )
+
+        if plot_diagnostics:
+            diagnostic = " | ".join(plot_diagnostics)
+            self.progress_detail.setText(diagnostic)
+            LOGGER.warning("Legacy plot diagnostic: %s", diagnostic)
 
         if not curves:
             QMessageBox.warning(self, "Plot", "Нет данных")
@@ -3051,7 +3529,8 @@ class BvpSolverApp(QMainWindow):
         try:
             plt.show(block=False)
             plt.pause(0.001)
-        except Exception:
+        except Exception as exc:
+            LOGGER.warning("Non-blocking plot display failed: %s", exc)
             plt.show()
 
     def _draw_phase_with_crossing(self, curves, ax, colors):
@@ -3126,7 +3605,7 @@ class BvpSolverApp(QMainWindow):
 
     def on_export(self):
         t = self.TRANSLATIONS[self.current_lang]
-        if self.last_result is None or not is_result_acceptable(self.last_result):
+        if self.last_record is None:
             QMessageBox.warning(self, "Warning", t["err_no_solution"])
             return
 
@@ -3136,18 +3615,22 @@ class BvpSolverApp(QMainWindow):
         if not path:
             return
 
-        result = self.last_result
-        var_names = self.eq_editor.get_var_names()
+        record = self.last_record
+        result = record.result
+        var_names = list(record.request.var_names)
 
         if path.endswith(".json"):
             export_data = {
-                "method": result["method"],
-                "iterations": result["iterations"],
-                "residual_norm": result["residual_norm"],
-                "p_opt": result["p_opt"].tolist(),
+                "request_id": record.request_id,
+                "source_task_id": record.request.source_task_id,
+                "task_name": record.request.task_name,
+                "method": result.method,
+                "iterations": result.iterations,
+                "residual_norm": result.residual_norm,
+                "p_opt": result.p_opt.tolist(),
                 "var_names": var_names,
-                "t": result["t"].tolist(),
-                "y": {name: result["y"][i].tolist()
+                "t": result.t.tolist(),
+                "y": {name: result.y[i].tolist()
                       for i, name in enumerate(var_names)},
             }
             with open(path, "w", encoding="utf-8") as f:
@@ -3157,10 +3640,10 @@ class BvpSolverApp(QMainWindow):
                 # Header
                 header = "# t" + "".join([f"\t{name}" for name in var_names])
                 f.write(header + "\n")
-                for i in range(len(result["t"])):
-                    line = f"{result['t'][i]:.8f}"
+                for i in range(len(result.t)):
+                    line = f"{result.t[i]:.8f}"
                     for j in range(len(var_names)):
-                        line += f"\t{result['y'][j, i]:.8f}"
+                        line += f"\t{result.y[j, i]:.8f}"
                     f.write(line + "\n")
 
         self.progress_detail.setText(f"已导出: {path}")
@@ -3169,15 +3652,26 @@ class BvpSolverApp(QMainWindow):
         t = self.TRANSLATIONS[self.current_lang]
         reply = QMessageBox.question(self, "Confirm", t["confirm_clear"])
         if reply == QMessageBox.Yes:
-            self.last_result = None
-            self.last_failed_result = None
-            self.all_results = []
+            self.last_record = None
+            self.last_failed_record = None
+            self.last_cancelled_outcome = None
+            self.solve_records.clear()
             self._task_status.clear()
             self._refresh_task_table()
-            # 清除绿色样式
-            self.progress_bar_label.setStyleSheet("")
-            self.progress_bar_label.setText(t["status_ready"])
+            if hasattr(self, "_plot_widget") and self._plot_widget is not None:
+                try:
+                    self._plot_widget.close()
+                except RuntimeError:
+                    LOGGER.info("Plot widget was already destroyed during clear")
+                self._plot_widget = None
             self.progress_detail.setText("")
+            if self.solve_state not in {
+                GuiSolveState.RUNNING,
+                GuiSolveState.CANCEL_REQUESTED,
+            }:
+                self._set_gui_state(GuiSolveState.IDLE)
+            else:
+                self._render_gui_state()
 
     # ------------------------------------------------------------------
     # Локализация
@@ -3261,19 +3755,15 @@ class BvpSolverApp(QMainWindow):
 
         # ---- Action buttons ----
         self.btn_solve.setText(t["btn_solve"])
+        self.btn_cancel.setText(t["btn_cancel"])
         self.btn_plot.setText(t["btn_plot"])
         self.btn_export.setText(t["btn_export"])
         self.btn_clear.setText(t["btn_clear"])
 
         # (状态栏已移除)
 
-        # ---- 同步进度标签语言 ----
-        if self.last_result is not None:
-            self.progress_bar_label.setText(t["status_solved"])
-        elif self.current_task_idx >= 0 and self._task_status.get(self.current_task_idx) == "error":
-            self.progress_bar_label.setText(t["status_error"])
-        else:
-            self.progress_bar_label.setText(t["status_ready"])
+        # ---- 同步进度标签语言和集中状态 ----
+        self._render_gui_state()
 
         # ---- 同步更新绘图窗口语言 ----
         if hasattr(self, '_plot_widget') and self._plot_widget is not None:
@@ -3281,6 +3771,38 @@ class BvpSolverApp(QMainWindow):
                 self._plot_widget.set_lang(lang)
             except RuntimeError:
                 self._plot_widget = None
+
+    def closeEvent(self, event) -> None:
+        """Cooperatively cancel and join the active worker before destruction."""
+        self._closing = True
+        worker = self.active_worker
+        if worker is not None and worker.isRunning():
+            if self.active_cancellation_token is not None:
+                self.active_cancellation_token.cancel()
+            if self.solve_state is GuiSolveState.RUNNING:
+                self._set_gui_state(
+                    GuiSolveState.CANCEL_REQUESTED,
+                    "Window close requested cancellation; waiting for worker exit.",
+                )
+            LOGGER.info(
+                "Window close is waiting for request %s",
+                self.active_request_id,
+            )
+            if not worker.wait(self.close_wait_timeout_ms):
+                diagnostic = (
+                    "Window close wait timed out; the worker remains active and the "
+                    "window was not destroyed."
+                )
+                LOGGER.error(diagnostic)
+                self.progress_detail.setText(diagnostic)
+                self._closing = False
+                event.ignore()
+                return
+
+        self.active_worker = None
+        self.active_request_id = None
+        self.active_cancellation_token = None
+        event.accept()
 
 
 # ---------------------------------------------------------------------------
