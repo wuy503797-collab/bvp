@@ -1,0 +1,9 @@
+# Exact package versions exercised with Python 3.11.9 in the current host venv.
+# This file records the known-working environment; it has not yet been rebuilt
+# and verified on a clean machine.
+numpy==2.4.4
+scipy==1.17.1
+sympy==1.14.0
+matplotlib==3.10.9
+PyQt5==5.15.11
+pytest==9.0.3
