@@ -2,9 +2,23 @@
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from typing import Any
 
+from .expressions import SymPyParser
 from .models import BVPProblem, BVPValidationError, SolverConfig
+from .solver import BVPSolver as CoreBVPSolver
+
+
+class _RejectedLegacySolver:
+    """Preserve legacy construct-then-validate behavior for invalid Datasets."""
+
+    def __init__(self, errors: tuple[str, ...]) -> None:
+        self._errors = errors
+
+    def solve(self, callback: Callable[..., Any] | None = None) -> dict[str, Any]:
+        del callback
+        raise ValueError("; ".join(self._errors))
 
 
 def problem_from_dataset(dataset: Any) -> BVPProblem:
@@ -90,3 +104,25 @@ def dataset_kwargs(problem: BVPProblem, config: SolverConfig) -> dict[str, Any]:
         "t_star": problem.t_start,
         "aux_outputs": dict(problem.auxiliary_expressions),
     }
+
+
+def solver_from_dataset(
+    dataset: Any,
+    parser: SymPyParser | None = None,
+    cancellation_check: Callable[[], None] | None = None,
+) -> CoreBVPSolver | _RejectedLegacySolver:
+    """Build the unique core solver from a legacy GUI/JSON Dataset object."""
+    try:
+        problem = problem_from_dataset(dataset)
+        config = config_from_dataset(dataset)
+    except BVPValidationError as exc:
+        return _RejectedLegacySolver(exc.errors)
+    expression_parser = parser or SymPyParser(
+        list(problem.odes), list(problem.var_names)
+    )
+    return CoreBVPSolver(
+        problem,
+        config,
+        expression_parser,
+        cancellation_check=cancellation_check,
+    )

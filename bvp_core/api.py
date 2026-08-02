@@ -1,22 +1,23 @@
-"""Public no-window solve entry point backed by the current legacy solver."""
+"""Public no-window solve entry point backed only by the headless core."""
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from typing import Any
 
-from .adapters import dataset_kwargs
+from .expressions import SymPyParser
 from .models import BVPProblem, BVPValidationError, SolverConfig
 from .results import BVPResult
+from .solver import BVPSolver
 
 
-def _legacy_solver_components() -> tuple[type, type, type]:
-    """Load the existing implementation only when an actual solve is requested."""
-    from main import BVPSolver, Dataset, SymPyParser
-
-    return Dataset, SymPyParser, BVPSolver
-
-
-def solve_bvp_problem(problem: BVPProblem, config: SolverConfig) -> BVPResult:
+def solve_bvp_problem(
+    problem: BVPProblem,
+    config: SolverConfig,
+    *,
+    cancellation_check: Callable[[], None] | None = None,
+    callback: Callable[[str, int, str], None] | None = None,
+) -> BVPResult:
     """Solve one BVP without creating QApplication, windows, plots, or files.
 
     Definition errors raise ``BVPValidationError`` before numerical solving. Expected
@@ -30,16 +31,23 @@ def solve_bvp_problem(problem: BVPProblem, config: SolverConfig) -> BVPResult:
     problem.validate()
     config.validate()
 
-    Dataset, SymPyParser, BVPSolver = _legacy_solver_components()
-    dataset = Dataset(**dataset_kwargs(problem, config))
+    if cancellation_check is not None:
+        cancellation_check()
     try:
-        parser = SymPyParser(dataset.equations, dataset.var_names)
+        parser = SymPyParser(list(problem.odes), list(problem.var_names))
         parser.lambdify_all()
-        solver = BVPSolver(dataset, parser)
+        if cancellation_check is not None:
+            cancellation_check()
+        solver = BVPSolver(
+            problem,
+            config,
+            parser,
+            cancellation_check=cancellation_check,
+        )
     except (TypeError, ValueError, SyntaxError) as exc:
         raise BVPValidationError(
             f"Problem expression validation failed: {type(exc).__name__}: {exc}"
         ) from exc
 
-    legacy_result: dict[str, Any] = solver.solve()
+    legacy_result: dict[str, Any] = solver.solve(callback=callback)
     return BVPResult.from_legacy_dict(legacy_result)

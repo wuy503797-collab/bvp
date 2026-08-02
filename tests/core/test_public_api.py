@@ -50,15 +50,13 @@ def _validate_exact_result(
     assert result.boundary_success is True
     assert result.sol is not None and callable(result.sol.sol)
 
-    # The public API intentionally exposes no parser/mapper. Reconstructing these
-    # pure legacy functions here verifies the public result without GUI state.
-    from main import BVPSolver, Dataset, SymPyParser
-    from bvp_core.adapters import dataset_kwargs
+    # Reconstruct the pure core functions to validate the structured result.
+    from bvp_core.expressions import SymPyParser
+    from bvp_core.solver import BVPSolver
 
-    dataset = Dataset(**dataset_kwargs(problem, config))
-    parser = SymPyParser(dataset.equations, dataset.var_names)
+    parser = SymPyParser(list(problem.odes), list(problem.var_names))
     parser.lambdify_all()
-    solver = BVPSolver(dataset, parser)
+    solver = BVPSolver(problem, config, parser)
     t, y = sample_dense_solution(
         result.sol.sol, (problem.t_start, problem.t_end), sample_count=201
     )

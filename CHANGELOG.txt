@@ -1,6 +1,16 @@
 CHANGELOG
 =========
 
+v2.5 (2026-08)
+- 将 SymPyParser 唯一实现迁入 bvp_core.expressions，保持现有表达式行为
+- 将 IVPIntegrationError 唯一实现迁入 bvp_core.exceptions，保留完整 IVP 诊断
+- 将 BVPSolver 数值实现迁入 bvp_core.solver，算法、容差、分支顺序和结果字段不变
+- bvp_core.api 删除对 main.py 的运行时延迟导入，实际求解不加载 main 或 PyQt5
+- main.py 改为核心类兼容导入，Dataset 继续作为 GUI/JSON 适配层
+- SolverWorker 继续使用不可变 SolveRequest，并统一调用公共核心 API
+- 新增表达式、求解器、导入边界、旧入口兼容和唯一实现契约测试
+- 第三阶段解析解、制造解和 ODE 数值一致性指标保持不变
+
 v2.4 (2026-08)
 - 新增不可变 SolveRequest、唯一 request_id 和来源快照
 - 新增 SolveRecord 成功历史及结构化完成、失败和取消事件

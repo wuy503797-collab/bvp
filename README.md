@@ -79,9 +79,9 @@ fallback、延拓步骤/Newton 迭代和最终验收附近被检查；正在执�
 窗口时会先请求取消并有限等待线程安全退出；若等待超时，窗口保持打开并保留诊断，
 不会调用 `QThread.terminate()`。
 
-GUI 仍处于渐进解耦阶段。第五阶段的 worker 消费 `SolveRequest`，但为避免当前
-`bvp_core.api → main.py` 过渡架构形成运行时循环，仍直接调用 `main.py` 中现有解析器
-和求解器；这条依赖没有扩大，完整迁移仍留给第六阶段。
+GUI worker 继续消费不可变 `SolveRequest`，但数值调用现在统一经过
+`bvp_core.solve_bvp_problem()`。`main.py` 只保留 Dataset/JSON 兼容、Qt worker、窗口、
+绘图和导出职责，不再包含表达式解析器或数值求解算法的真实定义。
 
 ## 无 GUI 核心 API
 
@@ -124,19 +124,22 @@ else:
 数值求解前抛出 `BVPValidationError`；预期内的数值失败则返回
 `BVPResult(success=False)`，并保留状态、IVP 诊断和最终边界残差。
 
-导入 `bvp_core` 本身不会导入 `main.py` 或启动 Qt。现阶段实际求解仍通过一个明确的
-兼容适配层复用 `main.py` 中已经验证的 `SymPyParser` 和 `BVPSolver`，但不会创建 GUI。
-`Dataset` 暂时保留为 JSON/GUI 兼容输入层，`BVPResult` 是新代码推荐的结果接口，旧
-结果字典由 `to_dict()` 暂时保留。这保持了第三阶段数值基线，同时为后续把算法实现
-移出 GUI 模块提供稳定边界。GUI 仍是当前桌面用户入口，公共 API 仍处于迭代阶段。
+导入或实际调用 `bvp_core` 均不会导入 `main.py`、PyQt5、窗口或绘图后端。核心实现的
+职责分布如下：
 
-### 过渡性技术债务
+- `bvp_core.expressions`：现有 SymPy 表达式解析、ODE/Jacobian、边界条件和辅助表达式；
+- `bvp_core.exceptions`：带 SciPy IVP 状态、消息、终止位置和候选参数的失败类型；
+- `bvp_core.solver`：打靶、root→least_squares fallback、参数延拓和最终数值验收；
+- `bvp_core.api`：将公共模型送入核心求解器并返回不可变 `BVPResult`。
 
-`solve_bvp_problem()` 在真正求解时仍会延迟导入并复用 `main.py` 中的
-`SymPyParser` 和 `BVPSolver`。导入 `bvp_core` 本身没有 GUI 副作用，也没有循环导入，
-因此不影响第四阶段验收；但当前核心包还不是解析与求解实现完全独立的核心包。
-第五阶段只处理 GUI 生命周期，不应继续扩大这条依赖；计划在第六阶段迁移解析器和
-求解器，并由 `main.py` 反向消费独立核心实现。
+`Dataset` 继续作为 GUI 和旧 JSON 的兼容输入层，由 `bvp_core.adapters` 转换为
+`BVPProblem + SolverConfig`；它不是核心求解器的事实来源。`main.py` 仍兼容导出
+`SymPyParser`、`IVPIntegrationError` 和可用旧 Dataset 构造方式调用的 `BVPSolver`
+入口，但数值算法只有 `bvp_core.solver.BVPSolver` 一份真实实现。
+
+解析器迁移只保证现有合法表达式、变量顺序、数组形状和主要错误行为保持不变，并不
+代表已经完成针对任意不可信表达式的安全加固。取消仍采用协作式检查点；单次正在执行
+的 `solve_ivp` 不能被立即中断。
 
 ## 自动化测试
 
@@ -149,6 +152,7 @@ python -m pytest -q
 - 正向数值基线：确认当前 26.1 双体问题仍能得到有限结果和合格的终端边界残差；
 - 正确性回归：确认无解问题被拒绝、IVP 失败被传播、输入维数被提前验证；
 - 核心 API：确认模型不可变、结果数组防御性复制、无窗口导入、失败语义和旧接口兼容；
+- 核心迁移契约：确认表达式数值行为、求解器字典字段、唯一实现和实际求解无 main/Qt；
 - GUI 生命周期：确认请求快照、结果溯源、过期/重复信号、协作式取消和安全关闭；
 - 数值验证：用解析解和制造解检查未知参数、全部状态、边界条件和 ODE 积分缺陷。
 
