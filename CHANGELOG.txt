@@ -1,6 +1,16 @@
 CHANGELOG
 =========
 
+v2.6 (2026-08)
+- 将 GUI/JSON 外部表达式统一收口到受限 AST-to-SymPy 解析入口，不再使用 parse_expr 或自动创建未知对象
+- 为 ODE、边界条件、辅助输出和 GUI 标量初值建立独立符号上下文
+- 明确算术运算、数学函数、常量与 ASCII 标识符白名单，并拒绝名称冲突
+- 在 SymPy 构造前拒绝属性、下标、Lambda、推导式、容器、字符串、任意调用和多语句输入
+- 增加表达式长度、AST 节点、嵌套、数值字面量、函数调用和幂运算复杂度限制
+- 新增带上下文、字段序号、错误码、截断预览和原因的 ExpressionValidationError
+- GUI 在创建 worker 前显示表达式验证错误；辅助表达式失败继续逐项隔离
+- 新增危险输入、合法语法、全部任务文件和离屏 GUI 安全回归测试及独立验收脚本
+
 v2.5 (2026-08)
 - 将 SymPyParser 唯一实现迁入 bvp_core.expressions，保持现有表达式行为
 - 将 IVPIntegrationError 唯一实现迁入 bvp_core.exceptions，保留完整 IVP 诊断

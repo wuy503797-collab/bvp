@@ -5,6 +5,7 @@ from __future__ import annotations
 from collections.abc import Callable
 from typing import Any
 
+from .exceptions import ExpressionValidationError
 from .expressions import SymPyParser
 from .models import BVPProblem, BVPValidationError, SolverConfig
 from .results import BVPResult
@@ -44,6 +45,8 @@ def solve_bvp_problem(
             parser,
             cancellation_check=cancellation_check,
         )
+    except ExpressionValidationError:
+        raise
     except (TypeError, ValueError, SyntaxError) as exc:
         raise BVPValidationError(
             f"Problem expression validation failed: {type(exc).__name__}: {exc}"

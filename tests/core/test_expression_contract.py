@@ -9,6 +9,7 @@ import numpy as np
 import pytest
 
 from bvp_core.expressions import SymPyParser
+from bvp_core.exceptions import ExpressionValidationError
 
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
@@ -144,12 +145,16 @@ def test_boundary_expression_maps_left_and_right_state_in_index_order() -> None:
 
 
 def test_unknown_symbol_preserves_explicit_parse_failure() -> None:
-    with pytest.raises(NameError, match="Symbol"):
+    with pytest.raises(ExpressionValidationError) as captured:
         _parsed(["unknown_state + x"], ["x"])
+
+    assert captured.value.error_code == "unknown_symbol"
 
 
 @pytest.mark.parametrize("var_names", [["x", "x"], ["t"]])
 def test_state_variable_name_collision_preserves_explicit_failure(var_names) -> None:
     equations = ["x", "-x"] if len(var_names) == 2 else ["t"]
-    with pytest.raises(SyntaxError, match="duplicate argument"):
+    with pytest.raises(ExpressionValidationError) as captured:
         _parsed(equations, var_names)
+
+    assert captured.value.error_code == "name_conflict"

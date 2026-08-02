@@ -6,6 +6,47 @@ from typing import Any
 
 import numpy as np
 
+from .models import BVPValidationError
+
+
+class ExpressionValidationError(BVPValidationError):
+    """Structured rejection raised at the mathematical-expression boundary."""
+
+    PREVIEW_LIMIT = 160
+
+    def __init__(
+        self,
+        *,
+        context: str,
+        expression: object,
+        error_code: str,
+        message: str,
+        field_index: int | None = None,
+        position: int | None = None,
+    ) -> None:
+        raw_expression = expression if isinstance(expression, str) else repr(expression)
+        preview = raw_expression.replace("\r", "\\r").replace("\n", "\\n")
+        if len(preview) > self.PREVIEW_LIMIT:
+            preview = preview[: self.PREVIEW_LIMIT - 1] + "…"
+        self.context = str(getattr(context, "value", context))
+        self.expression_preview = preview
+        self.expression = preview
+        self.error_code = str(error_code)
+        self.human_message = str(message)
+        self.reason = self.human_message
+        self.field_index = field_index
+        self.position = position
+        location = self.context
+        if field_index is not None:
+            location += f" expression #{field_index + 1}"
+        if position is not None:
+            location += f" at column {position}"
+        diagnostic = (
+            f"[{self.error_code}] {location}: {self.human_message}; "
+            f"expression={self.expression_preview!r}"
+        )
+        super().__init__(diagnostic)
+
 
 class IVPIntegrationError(RuntimeError):
     """Failure of the inner initial-value problem with preserved SciPy diagnostics."""

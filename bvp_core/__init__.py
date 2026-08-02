@@ -1,7 +1,8 @@
 """Public, GUI-independent models and API for the BVP project."""
 
 from .api import solve_bvp_problem
-from .exceptions import IVPIntegrationError
+from .exceptions import ExpressionValidationError, IVPIntegrationError
+from .expression_policy import ExpressionContext
 from .expressions import SymPyParser
 from .models import BVPProblem, BVPValidationError, SolverConfig
 from .requests import (
@@ -26,6 +27,8 @@ __all__ = [
     "BVPSolver",
     "BVPValidationError",
     "CancellationToken",
+    "ExpressionContext",
+    "ExpressionValidationError",
     "GuiSolveState",
     "IVPIntegrationError",
     "PlotCompatibility",

@@ -36,9 +36,6 @@ from uuid import uuid4
 
 import numpy as np
 
-import sympy as sp
-from sympy.parsing.sympy_parser import parse_expr, standard_transformations
-
 import matplotlib
 matplotlib.use("Qt5Agg")
 matplotlib.rcParams["toolbar"] = "toolmanager"
@@ -68,7 +65,7 @@ from bvp_core.adapters import (
     problem_from_dataset,
     solver_from_dataset as BVPSolver,
 )
-from bvp_core.exceptions import IVPIntegrationError
+from bvp_core.exceptions import ExpressionValidationError, IVPIntegrationError
 from bvp_core.expressions import SymPyParser
 from bvp_core.requests import (
     CancellationToken,
@@ -201,14 +198,24 @@ class Dataset:
         from bvp_core.models import BVPValidationError
 
         errors: List[str] = []
+        problem = None
         try:
-            problem_from_dataset(self)
+            problem = problem_from_dataset(self)
         except BVPValidationError as exc:
             errors.extend(exc.errors)
         try:
             config_from_dataset(self)
         except BVPValidationError as exc:
             errors.extend(exc.errors)
+        if problem is not None:
+            try:
+                parser = SymPyParser(list(problem.odes), list(problem.var_names))
+                parser.lambdify_all()
+                SymPyParser.parse_boundary_conditions(
+                    list(problem.boundary_conditions), list(problem.var_names)
+                )
+            except ExpressionValidationError as exc:
+                errors.extend(exc.errors)
         return errors
 
 
@@ -1335,13 +1342,11 @@ class BvpSolverApp(QMainWindow):
                     raw_guess.append(float(s_clean))
                 except ValueError:
                     try:
-                        expr = parse_expr(s_clean, global_dict={
-                            "pi": sp.pi, "e": sp.E,
-                            "sin": sp.sin, "cos": sp.cos, "sqrt": sp.sqrt,
-                            "Integer": sp.Integer, "Float": sp.Float,
-                        }, transformations=standard_transformations, evaluate=True)
+                        expr = SymPyParser.parse_scalar(s_clean)
                         raw_guess.append(float(expr.evalf()))
-                    except Exception:
+                    except ExpressionValidationError:
+                        raise
+                    except (TypeError, ValueError, OverflowError):
                         pass
         n_dim = len(eqs)
         # Если guess длины n — полный вектор, извлекаем unknown

@@ -184,6 +184,60 @@ def test_gui_builds_request_from_one_editor_snapshot(window) -> None:
     assert request.auxiliary_expressions == {"double": "2*x"}
 
 
+def test_dangerous_ode_is_rejected_before_worker_creation(window, monkeypatch) -> None:
+    dataset = _dataset("Unsafe ODE")
+    window.tasks = [dataset]
+    window._task_ids = ["unsafe-ode"]
+    window.current_task_idx = 0
+    window._sync_task_to_editor(dataset)
+    window.eq_editor.eq_editors[0].setText('__import__("os")')
+    warnings = []
+    worker_created = False
+
+    monkeypatch.setattr(
+        QMessageBox,
+        "warning",
+        lambda _parent, title, message: warnings.append((title, message)),
+    )
+
+    def unexpected_worker(*_args, **_kwargs):
+        nonlocal worker_created
+        worker_created = True
+        raise AssertionError("unsafe expressions must be rejected before a worker starts")
+
+    window.worker_factory = unexpected_worker
+
+    assert window.on_solve() is False
+    assert worker_created is False
+    assert window.active_worker is None
+    assert window.solve_state is GuiSolveState.IDLE
+    diagnostic = " ".join(str(item) for warning in warnings for item in warning)
+    assert "ODE" in diagnostic
+    assert "forbidden_name" in diagnostic
+    assert "__import__" in diagnostic
+
+
+def test_dangerous_initial_guess_cannot_bypass_core_parser(window, monkeypatch) -> None:
+    dataset = _dataset("Unsafe guess")
+    window.tasks = [dataset]
+    window._task_ids = ["unsafe-guess"]
+    window.current_task_idx = 0
+    window._sync_task_to_editor(dataset)
+    window.input_guess.setText('__import__("os")')
+    warnings = []
+    monkeypatch.setattr(
+        QMessageBox,
+        "warning",
+        lambda _parent, title, message: warnings.append((title, message)),
+    )
+
+    assert window.on_solve() is False
+    assert window.active_worker is None
+    diagnostic = " ".join(str(item) for warning in warnings for item in warning)
+    assert "SCALAR" in diagnostic
+    assert "forbidden_name" in diagnostic
+
+
 def test_task_switch_does_not_pollute_result_or_auxiliary_snapshot(window) -> None:
     task_a = _dataset("A", auxiliary="2*x")
     task_b = _dataset("B", variable="b", auxiliary="3*b")
@@ -412,6 +466,18 @@ def test_invalid_auxiliary_expression_keeps_primary_result(window) -> None:
     assert record.auxiliary_outputs == {}
     assert len(record.auxiliary_errors) == 1
     assert "double" in record.auxiliary_errors[0]
+
+
+def test_dangerous_auxiliary_expression_is_isolated_after_primary_solve(window) -> None:
+    record = _complete(
+        window,
+        _request("unsafe-aux", auxiliary='__import__("os")'),
+    )
+
+    assert record.result.success is True
+    assert record.auxiliary_outputs == {}
+    assert len(record.auxiliary_errors) == 1
+    assert "forbidden_name" in record.auxiliary_errors[0]
 
 
 def test_close_event_cooperatively_cancels_and_joins_worker(window) -> None:
