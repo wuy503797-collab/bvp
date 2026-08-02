@@ -1,4 +1,4 @@
-"""Strict xfail specifications for defects intentionally left for phase two."""
+"""Regression tests for numerical-correctness defects closed in phase two."""
 
 from __future__ import annotations
 
@@ -49,14 +49,6 @@ def _independent_boundary_residual(
     return solver.bc_residual(initial_state, result["y"][:, -1])
 
 
-@pytest.mark.xfail(
-    strict=True,
-    raises=AssertionError,
-    reason=(
-        "BVP-P0-001: shooting solver accepts optimizer termination with "
-        "invalid boundary residual"
-    ),
-)
 def test_shooting_rejects_problem_without_real_boundary_root() -> None:
     dataset = _no_real_root_dataset("shooting")
     solver = _build_solver(dataset)
@@ -64,26 +56,25 @@ def test_shooting_rejects_problem_without_real_boundary_root() -> None:
     boundary_residual = _independent_boundary_residual(solver, result)
     boundary_residual_norm = float(np.linalg.norm(boundary_residual))
 
-    if not result["sol"].success:
-        raise RuntimeError("The known defect requires a successful IVP integration")
-    if not np.isfinite(result["y"]).all() or not np.isfinite(boundary_residual).all():
-        raise RuntimeError("The known defect requires finite state and residual data")
-    if boundary_residual_norm <= dataset.eps:
-        raise RuntimeError("The constructed problem unexpectedly satisfies the boundary")
-
-    if not np.allclose(boundary_residual, [1.0], rtol=0.0, atol=1e-12):
-        raise RuntimeError(f"unexpected regression residual: {boundary_residual!r}")
     assert result["success"] is False
+    assert result["status"] == "boundary_residual_too_large"
+    assert result["optimizer_success"] is True
+    assert result["ivp_success"] is True
+    assert result["finite_success"] is True
+    assert result["boundary_success"] is False
+    assert result["sol"].success is True
+    assert np.isfinite(result["y"]).all()
+    assert np.isfinite(boundary_residual).all()
+    assert boundary_residual_norm > result["boundary_atol"]
+    np.testing.assert_allclose(boundary_residual, [1.0], rtol=0.0, atol=1e-12)
+    np.testing.assert_allclose(
+        result["boundary_residual"], boundary_residual, rtol=0.0, atol=1e-12
+    )
+    assert result["boundary_residual_norm"] == pytest.approx(
+        boundary_residual_norm, rel=0.0, abs=1e-12
+    )
 
 
-@pytest.mark.xfail(
-    strict=True,
-    raises=AssertionError,
-    reason=(
-        "BVP-P0-002: continuation solver returns success without final "
-        "residual acceptance"
-    ),
-)
 def test_continuation_rejects_problem_without_real_boundary_root() -> None:
     dataset = _no_real_root_dataset("continuation")
     solver = _build_solver(dataset)
@@ -91,25 +82,25 @@ def test_continuation_rejects_problem_without_real_boundary_root() -> None:
     boundary_residual = _independent_boundary_residual(solver, result)
     boundary_residual_norm = float(np.linalg.norm(boundary_residual))
 
-    if not result["sol"].success:
-        raise RuntimeError("The known defect requires a successful IVP integration")
-    if not np.isfinite(result["y"]).all() or not np.isfinite(boundary_residual).all():
-        raise RuntimeError("The known defect requires finite state and residual data")
-    if boundary_residual_norm <= dataset.eps:
-        raise RuntimeError("The constructed problem unexpectedly satisfies the boundary")
-
-    if not np.allclose(boundary_residual, [1.0], rtol=0.0, atol=1e-12):
-        raise RuntimeError(f"unexpected regression residual: {boundary_residual!r}")
     assert result["success"] is False
+    assert result["status"] == "continuation_failed"
+    assert result["optimizer_success"] is False
+    assert result["ivp_success"] is True
+    assert result["finite_success"] is True
+    assert result["boundary_success"] is False
+    assert result["sol"].success is True
+    assert np.isfinite(result["y"]).all()
+    assert np.isfinite(boundary_residual).all()
+    assert boundary_residual_norm > result["boundary_atol"]
+    np.testing.assert_allclose(boundary_residual, [1.0], rtol=0.0, atol=1e-12)
+    np.testing.assert_allclose(
+        result["boundary_residual"], boundary_residual, rtol=0.0, atol=1e-12
+    )
+    assert result["boundary_residual_norm"] == pytest.approx(
+        boundary_residual_norm, rel=0.0, abs=1e-12
+    )
 
 
-@pytest.mark.xfail(
-    strict=True,
-    raises=AssertionError,
-    reason=(
-        "BVP-P1-001: validation does not reject a boundary/unknown dimension mismatch"
-    ),
-)
 def test_validation_rejects_boundary_unknown_dimension_mismatch() -> None:
     dataset = Dataset(
         name="Boundary dimension mismatch",
@@ -136,36 +127,31 @@ def test_validation_rejects_boundary_unknown_dimension_mismatch() -> None:
         or ("边界" in message and "未知" in message)
     )
     assert clear_dimension_terms, "Validation error must explain the dimension mismatch"
+    assert "input validation" in message
+    assert "2" in message and "1" in message
+
+    solver = _build_solver(dataset)
+    with pytest.raises(ValueError, match="boundary condition count is 2"):
+        solver.solve()
 
 
-@pytest.mark.xfail(
-    strict=True,
-    raises=AssertionError,
-    reason=(
-        "BVP-P1-002: singular IVP failure is not returned as a diagnostic "
-        "success=False result"
-    ),
-)
 def test_singular_ivp_returns_diagnostic_failure_result() -> None:
     task_path = REPO_ROOT / "task_error_test.json"
     task_data = json.loads(task_path.read_text(encoding="utf-8"))[0]
     dataset = Dataset.from_dict(task_data)
     solver = _build_solver(dataset)
 
-    try:
-        result = solver.solve()
-    except RuntimeError as exc:
-        message = str(exc)
-        if "solve_ivp" not in message:
-            raise
-        result = {"success": None, "message": message, "y": None}
-
+    result = solver.solve()
     message = str(result.get("message", ""))
-    if not message:
-        raise RuntimeError("A singular IVP failure must retain a diagnostic message")
-
-    if result.get("success") is True and result.get("y") is not None:
-        if not np.isfinite(result["y"]).all():
-            raise RuntimeError("Non-finite state data must never be marked successful")
-
-    assert result.get("success") is False
+    assert result["success"] is False
+    assert result["status"] == "ivp_failed"
+    assert result["ivp_success"] is False
+    assert result["boundary_success"] is False
+    assert result["optimizer_success"] is False
+    assert result["ivp_status"] is not None
+    assert result["ivp_t_final"] is not None
+    assert result["ivp_t_final"] < dataset.T
+    assert "ivp" in message.lower() or "solve_ivp" in message.lower()
+    assert "status" in message.lower()
+    assert result["ivp_message"]
+    assert not (result["success"] and not np.isfinite(result["y"]).all())

@@ -1,4 +1,4 @@
-"""Print reproducible phase-one numerical baselines without creating artifacts."""
+"""Print phase-two positive baselines and expected invalid-problem rejections."""
 
 from __future__ import annotations
 
@@ -117,9 +117,12 @@ def run_main_continuation() -> dict[str, Any]:
     ivp_success = bool(result["sol"].success)
     accepted = bool(
         result["success"]
+        and result["ivp_success"]
+        and result["finite_success"]
+        and result["boundary_success"]
         and ivp_success
         and finite
-        and boundary_residual_norm <= BOUNDARY_TOL
+        and boundary_residual_norm <= dataset.boundary_atol
     )
 
     return {
@@ -128,19 +131,24 @@ def run_main_continuation() -> dict[str, Any]:
         "initial_guess": np.asarray(dataset.guess),
         "p_opt": result["p_opt"],
         "solver_reported_success": bool(result["success"]),
+        "status": result["status"],
         "ivp_success": ivp_success,
         "state_finite": finite,
+        "finite_success": result["finite_success"],
+        "boundary_success": result["boundary_success"],
         "boundary_residual": boundary_residual,
         "boundary_residual_norm": boundary_residual_norm,
         "reported_residual_norm": float(result["residual_norm"]),
-        "acceptance_threshold": BOUNDARY_TOL,
-        "independent_boundary_validation": boundary_residual_norm <= BOUNDARY_TOL,
+        "acceptance_threshold": dataset.boundary_atol,
+        "independent_boundary_validation": (
+            boundary_residual_norm <= dataset.boundary_atol
+        ),
         "elapsed_seconds": elapsed,
         "baseline_accepted": accepted,
     }
 
 
-def run_known_no_root_defect(method: str, defect_id: str) -> dict[str, Any]:
+def run_expected_invalid_problem(method: str, defect_id: str) -> dict[str, Any]:
     dataset = Dataset(
         name=f"No real root ({method})",
         equations=["0"],
@@ -172,9 +180,13 @@ def run_known_no_root_defect(method: str, defect_id: str) -> dict[str, Any]:
     )
     ivp_success = bool(result["sol"].success)
     independent_valid = bool(
-        ivp_success and finite and boundary_residual_norm <= dataset.eps
+        ivp_success and finite and boundary_residual_norm <= dataset.boundary_atol
     )
-    known_defect = bool(result["success"] and not independent_valid)
+    correctly_rejected = bool(
+        result["success"] is False
+        and result["boundary_success"] is False
+        and not independent_valid
+    )
 
     return {
         "case": f"no-real-root {method}",
@@ -182,17 +194,26 @@ def run_known_no_root_defect(method: str, defect_id: str) -> dict[str, Any]:
         "initial_guess": np.asarray(dataset.guess),
         "p_opt": result["p_opt"],
         "solver_reported_success": bool(result["success"]),
+        "solver_status": result["status"],
+        "solver_message": result["message"],
         "ivp_success": ivp_success,
         "state_finite": finite,
+        "finite_success": result["finite_success"],
+        "boundary_success": result["boundary_success"],
         "boundary_residual": boundary_residual,
         "boundary_residual_norm": boundary_residual_norm,
-        "acceptance_threshold": dataset.eps,
+        "acceptance_threshold": dataset.boundary_atol,
+        "boundary_validation": independent_valid,
         "independent_boundary_validation": independent_valid,
         "elapsed_seconds": elapsed,
-        "known_defect_id": defect_id,
-        "known_defect": known_defect,
-        "baseline_accepted": False,
-        "status": "KNOWN_DEFECT_REPRODUCED" if known_defect else "DEFECT_NOT_REPRODUCED",
+        "closed_defect_id": defect_id,
+        "correctly_rejected": correctly_rejected,
+        "baseline_accepted": correctly_rejected,
+        "case_status": (
+            "EXPECTED_INVALID_PROBLEM_REJECTED"
+            if correctly_rejected
+            else "INVALID_PROBLEM_HANDLING_FAILED"
+        ),
     }
 
 
@@ -211,34 +232,40 @@ def main() -> int:
 
     standalone = run_standalone_two_body()
     continuation = run_main_continuation()
-    shooting_defect = run_known_no_root_defect("shooting", "BVP-P0-001")
-    continuation_defect = run_known_no_root_defect(
+    shooting_rejection = run_expected_invalid_problem("shooting", "BVP-P0-001")
+    continuation_rejection = run_expected_invalid_problem(
         "continuation", "BVP-P0-002"
     )
 
-    for result in (standalone, continuation, shooting_defect, continuation_defect):
+    for result in (
+        standalone,
+        continuation,
+        shooting_rejection,
+        continuation_rejection,
+    ):
         _print_section(result["case"], result)
 
     positive_baselines_passed = bool(
         standalone["baseline_accepted"] and continuation["baseline_accepted"]
     )
-    known_defects_observed = bool(
-        shooting_defect["known_defect"] and continuation_defect["known_defect"]
+    invalid_problems_rejected = bool(
+        shooting_rejection["correctly_rejected"]
+        and continuation_rejection["correctly_rejected"]
     )
-    phase_one_complete = positive_baselines_passed and known_defects_observed
-    phase_one_status = (
-        "PASS_WITH_KNOWN_DEFECTS" if phase_one_complete else "BASELINE_FAILED"
+    phase_two_complete = positive_baselines_passed and invalid_problems_rejected
+    phase_two_status = (
+        "PASS" if phase_two_complete else "PHASE_TWO_BASELINE_FAILED"
     )
 
     _print_section(
         "summary",
         {
             "positive_baselines_passed": positive_baselines_passed,
-            "known_defects_observed": known_defects_observed,
-            "phase_one_status": phase_one_status,
+            "invalid_problems_rejected": invalid_problems_rejected,
+            "phase_two_status": phase_two_status,
         },
     )
-    return 0 if phase_one_complete else 1
+    return 0 if phase_two_complete else 1
 
 
 if __name__ == "__main__":

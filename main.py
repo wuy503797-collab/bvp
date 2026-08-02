@@ -89,6 +89,11 @@ class Dataset:
     guess: List[float] = field(default_factory=list)
     # Параметры интегрирования
     eps: float = 1e-8
+    # Независимый критерий приёмки конечной граничной невязки.
+    # boundary_rtol зарезервирован для будущего масштабированного критерия;
+    # текущая проверка использует ||Phi||_2 <= boundary_atol.
+    boundary_atol: float = 1e-8
+    boundary_rtol: float = 0.0
     method: str = "RK45"
     # Выбор метода решения: "shooting" | "continuation"
     solver_method: str = "continuation"
@@ -117,6 +122,8 @@ class Dataset:
             "boundary_conditions": self.boundary_conditions,
             "guess": self.guess,
             "eps": self.eps,
+            "boundary_atol": self.boundary_atol,
+            "boundary_rtol": self.boundary_rtol,
             "method": self.method,
             "solver_method": self.solver_method,
             "continuation_steps": self.continuation_steps,
@@ -149,6 +156,8 @@ class Dataset:
             boundary_conditions=list(d.get("boundary_conditions", [])),
             guess=list(d.get("guess", [])),
             eps=float(d.get("eps", 1e-8)),
+            boundary_atol=float(d.get("boundary_atol", 1e-8)),
+            boundary_rtol=float(d.get("boundary_rtol", 0.0)),
             method=d.get("method", "RK45"),
             solver_method=d.get("solver_method", "continuation"),
             continuation_steps=int(d.get("continuation_steps", 50)),
@@ -179,10 +188,53 @@ class Dataset:
             )
         if not self.unknown_indices:
             errors.append("Нет неизвестных начальных условий (unknown_indices пуст)")
+        if len(self.boundary_conditions) != len(self.unknown_indices):
+            errors.append(
+                "Input validation: boundary condition count is "
+                f"{len(self.boundary_conditions)}, but unknown initial parameter "
+                f"count is {len(self.unknown_indices)}; the shooting root system "
+                "requires these counts to be equal."
+            )
         if len(self.guess) != len(self.unknown_indices):
             errors.append(
                 f"Приближение: guess={len(self.guess)}, "
                 f"неизвестных={len(self.unknown_indices)}"
+            )
+        valid_index_types = (int, np.integer)
+        invalid_known = [
+            idx
+            for idx in self.known_indices
+            if not isinstance(idx, valid_index_types) or not 0 <= idx < n
+        ]
+        invalid_unknown = [
+            idx
+            for idx in self.unknown_indices
+            if not isinstance(idx, valid_index_types) or not 0 <= idx < n
+        ]
+        if invalid_known:
+            errors.append(
+                f"Input validation: known_indices out of range for dimension {n}: "
+                f"{invalid_known}"
+            )
+        if invalid_unknown:
+            errors.append(
+                f"Input validation: unknown_indices out of range for dimension {n}: "
+                f"{invalid_unknown}"
+            )
+        overlap = sorted(set(self.known_indices) & set(self.unknown_indices))
+        if overlap:
+            errors.append(
+                "Input validation: known_indices and unknown_indices overlap at "
+                f"{overlap}; every initial-state index must have exactly one role."
+            )
+        if not np.isfinite(self.boundary_atol) or self.boundary_atol <= 0:
+            errors.append("Input validation: boundary_atol must be finite and positive")
+        if not np.isfinite(self.boundary_rtol) or self.boundary_rtol < 0:
+            errors.append("Input validation: boundary_rtol must be finite and non-negative")
+        if self.solver_method == "continuation" and self.continuation_steps < 1:
+            errors.append(
+                "Input validation: continuation_steps must be at least 1 for "
+                "the continuation solver"
             )
         return errors
 
@@ -375,6 +427,34 @@ class SymPyParser:
 # 3. BVPSolver — ядро: метод стрельбы + продолжения по параметру
 # ---------------------------------------------------------------------------
 
+class IVPIntegrationError(RuntimeError):
+    """Failure of the inner initial-value problem with preserved SciPy diagnostics."""
+
+    def __init__(
+        self, message: str, solution: Any = None, p: Optional[np.ndarray] = None
+    ):
+        self.solution = solution
+        self.p = None if p is None else np.asarray(p, dtype=float).copy()
+        self.ivp_success = bool(getattr(solution, "success", False))
+        self.ivp_status = getattr(solution, "status", None)
+        self.ivp_message = str(getattr(solution, "message", message))
+        t_values = np.asarray(getattr(solution, "t", []), dtype=float)
+        y_values = np.asarray(getattr(solution, "y", []), dtype=float)
+        self.t_final = float(t_values[-1]) if t_values.size else None
+        self.state_finite = bool(
+            solution is not None
+            and np.isfinite(t_values).all()
+            and np.isfinite(y_values).all()
+        )
+        super().__init__(message)
+
+
+def is_result_acceptable(result: dict) -> bool:
+    """Return whether a solver result may enter GUI history, plots, and export."""
+    required_flags = ("success", "ivp_success", "finite_success", "boundary_success")
+    return all(result.get(flag) is True for flag in required_flags)
+
+
 class BVPSolver:
     """
     Универсальный решатель краевых задач.
@@ -420,17 +500,247 @@ class BVPSolver:
 
     def _solve_ivp(self, p: np.ndarray, t_span: List[float],
                    dense_output: bool = False) -> Any:
-        """Решает внутреннюю задачу Коши для параметров p."""
+        """Solve the inner IVP and preserve diagnostics for every failure."""
         x0 = self._p_to_state(p)
-        sol = solve_ivp(
-            self.parser.f, t_span, x0,
-            method=self.ds.method,
-            dense_output=dense_output,
-            rtol=self.ds.eps, atol=self.ds.eps / 10,
+        try:
+            sol = solve_ivp(
+                self.parser.f, t_span, x0,
+                method=self.ds.method,
+                dense_output=dense_output,
+                rtol=self.ds.eps, atol=self.ds.eps / 10,
+            )
+        except Exception as exc:
+            raise IVPIntegrationError(
+                f"solve_ivp raised {type(exc).__name__}: {exc}", p=p
+            ) from exc
+
+        t_values = np.asarray(sol.t, dtype=float)
+        y_values = np.asarray(sol.y, dtype=float)
+        state_finite = bool(
+            np.isfinite(t_values).all() and np.isfinite(y_values).all()
         )
-        if not sol.success:
-            raise RuntimeError("solve_ivp не сошёлся")
+        t_final = float(t_values[-1]) if t_values.size else None
+        terminal_reached = bool(
+            t_values.size
+            and np.isclose(
+                t_final,
+                float(t_span[-1]),
+                rtol=0.0,
+                atol=max(1e-12, abs(float(t_span[-1])) * 1e-12),
+            )
+        )
+        if not sol.success or not state_finite or not terminal_reached:
+            message = (
+                "IVP integration failed: "
+                f"success={bool(sol.success)}, status={getattr(sol, 'status', None)}, "
+                f"t_final={t_final}, finite={state_finite}, "
+                f"message={getattr(sol, 'message', '')}"
+            )
+            raise IVPIntegrationError(message, sol, p=p)
         return sol
+
+    def _build_validated_result(
+        self,
+        *,
+        p: np.ndarray,
+        sol: Any,
+        boundary_residual: Optional[np.ndarray],
+        optimizer_success: bool,
+        algorithm_success: bool,
+        method: str,
+        iterations: int,
+        solver_metadata: Optional[dict] = None,
+        failure_status: Optional[str] = None,
+        failure_message: Optional[str] = None,
+    ) -> dict:
+        """Build one result shape and independently accept or reject the BVP."""
+        p_opt = np.asarray(p, dtype=float)
+        t_values = np.asarray(getattr(sol, "t", []), dtype=float)
+        y_values = np.asarray(getattr(sol, "y", []), dtype=float)
+        residual_available = boundary_residual is not None
+        residual = (
+            np.asarray(boundary_residual, dtype=float).reshape(-1)
+            if residual_available
+            else np.array([], dtype=float)
+        )
+
+        ivp_success = bool(getattr(sol, "success", False))
+        finite_success = bool(
+            residual_available
+            and np.isfinite(p_opt).all()
+            and np.isfinite(t_values).all()
+            and np.isfinite(y_values).all()
+            and np.isfinite(residual).all()
+        )
+        residual_norm = (
+            float(norm(residual)) if residual_available and np.isfinite(residual).all()
+            else float("inf")
+        )
+        boundary_success = bool(
+            ivp_success
+            and finite_success
+            and residual.size == len(self.ds.boundary_conditions)
+            and residual_norm <= self.ds.boundary_atol
+        )
+        success = bool(
+            ivp_success
+            and finite_success
+            and boundary_success
+            and algorithm_success
+        )
+
+        ivp_status = getattr(sol, "status", None)
+        ivp_message = str(getattr(sol, "message", "IVP solution is unavailable"))
+        ivp_t_final = float(t_values[-1]) if t_values.size else None
+
+        if success:
+            status = "success"
+            message = (
+                "Validated BVP solution: final boundary residual norm "
+                f"{residual_norm:.6e} <= boundary_atol "
+                f"{self.ds.boundary_atol:.6e}."
+            )
+        elif not ivp_success:
+            status = "ivp_failed"
+            message = failure_message or (
+                "IVP integration failed: "
+                f"status={ivp_status}, t_final={ivp_t_final}, message={ivp_message}"
+            )
+        elif not finite_success:
+            status = "non_finite_result"
+            message = failure_message or (
+                "Candidate parameters, IVP state, or boundary residual contain "
+                "non-finite or unavailable values."
+            )
+        elif not algorithm_success:
+            status = failure_status or "optimizer_failed"
+            message = failure_message or "The numerical algorithm did not converge."
+        elif not boundary_success:
+            status = "boundary_residual_too_large"
+            message = failure_message or (
+                "The optimizer terminated, but the final boundary residual did not "
+                f"meet acceptance: {residual_norm:.6e} > boundary_atol "
+                f"{self.ds.boundary_atol:.6e}."
+            )
+        else:
+            status = failure_status or "optimizer_failed"
+            message = failure_message or "The BVP result did not pass final acceptance."
+
+        return {
+            "success": success,
+            "status": status,
+            "message": message,
+            "method": method,
+            "p_opt": p_opt,
+            "t": t_values,
+            "y": y_values,
+            "sol": sol,
+            "ivp_success": ivp_success,
+            "ivp_status": ivp_status,
+            "ivp_message": ivp_message,
+            "ivp_t_final": ivp_t_final,
+            "optimizer_success": bool(optimizer_success),
+            "algorithm_success": bool(algorithm_success),
+            "finite_success": finite_success,
+            "boundary_success": boundary_success,
+            "boundary_residual": residual,
+            "boundary_residual_norm": residual_norm,
+            "boundary_atol": float(self.ds.boundary_atol),
+            "boundary_rtol": float(self.ds.boundary_rtol),
+            "boundary_acceptance": "l2_norm <= boundary_atol",
+            "solver_metadata": dict(solver_metadata or {}),
+            "iterations": int(iterations),
+            # Backward-compatible alias used by the GUI and phase-one tests.
+            "residual_norm": residual_norm,
+        }
+
+    def _build_ivp_failure_result(
+        self,
+        *,
+        p: np.ndarray,
+        method: str,
+        error: IVPIntegrationError,
+        optimizer_success: bool,
+        iterations: int,
+        solver_metadata: Optional[dict] = None,
+    ) -> dict:
+        candidate = error.p if error.p is not None else p
+        result = self._build_validated_result(
+            p=candidate,
+            sol=error.solution,
+            boundary_residual=None,
+            optimizer_success=optimizer_success,
+            algorithm_success=False,
+            method=method,
+            iterations=iterations,
+            solver_metadata=solver_metadata,
+            failure_status="ivp_failed",
+            failure_message=str(error),
+        )
+        result["ivp_status"] = error.ivp_status
+        result["ivp_message"] = error.ivp_message
+        result["ivp_t_final"] = error.t_final
+        result["ivp_state_finite"] = error.state_finite
+        return result
+
+    def _validate_final_candidate(
+        self,
+        *,
+        p: np.ndarray,
+        optimizer_success: bool,
+        algorithm_success: bool,
+        method: str,
+        iterations: int,
+        solver_metadata: Optional[dict] = None,
+        failure_status: Optional[str] = None,
+        failure_message: Optional[str] = None,
+    ) -> dict:
+        """Re-integrate a candidate, recompute Phi, and apply final acceptance."""
+        try:
+            sol = self._solve_ivp(
+                p, [self.ds.t_star, self.ds.T], dense_output=True
+            )
+        except IVPIntegrationError as exc:
+            return self._build_ivp_failure_result(
+                p=p,
+                method=method,
+                error=exc,
+                optimizer_success=optimizer_success,
+                iterations=iterations,
+                solver_metadata=solver_metadata,
+            )
+
+        try:
+            residual = self.bc_residual(self._p_to_state(p), sol.y[:, -1])
+        except Exception as exc:
+            return self._build_validated_result(
+                p=p,
+                sol=sol,
+                boundary_residual=None,
+                optimizer_success=optimizer_success,
+                algorithm_success=False,
+                method=method,
+                iterations=iterations,
+                solver_metadata=solver_metadata,
+                failure_status="boundary_evaluation_failed",
+                failure_message=(
+                    "Final boundary residual evaluation failed: "
+                    f"{type(exc).__name__}: {exc}"
+                ),
+            )
+
+        return self._build_validated_result(
+            p=p,
+            sol=sol,
+            boundary_residual=residual,
+            optimizer_success=optimizer_success,
+            algorithm_success=algorithm_success,
+            method=method,
+            iterations=iterations,
+            solver_metadata=solver_metadata,
+            failure_status=failure_status,
+            failure_message=failure_message,
+        )
 
     def _Phi(self, p: np.ndarray) -> np.ndarray:
         """
@@ -498,8 +808,10 @@ class BVPSolver:
                     Phi_perturb = self._Phi(p_perturb)
                     jac_matrix[:, j] = (Phi_perturb - Phi_base) / eps_jac
                 return jac_matrix
+        except IVPIntegrationError:
+            raise
         except Exception:
-            pass  # Переходим к fallback
+            return self._dPhi_dp_numerical(p, Phi_base)
 
         # --- Попытка 2 (fallback): чистое численное дифференцирование ---
         return self._dPhi_dp_numerical(p, Phi_base)
@@ -558,7 +870,7 @@ class BVPSolver:
           2. При неудаче — scipy.optimize.least_squares (LM) — более робастный.
         """
         from scipy.optimize import least_squares
-        
+
         p0 = np.array(self.ds.guess, dtype=float)
 
         def residual(p):
@@ -567,47 +879,126 @@ class BVPSolver:
         if callback:
             callback("shooting", 0, "Начало метода стрельбы (hybr)...")
 
-        # Попытка 1: hybr (быстрый)
-        ans = root(residual, p0, method="hybr", tol=self.ds.eps,
-                   options={"maxfev": 100 * len(p0)})
+        solver_metadata: Dict[str, Any] = {
+            "optimizer": "root/hybr",
+            "fallback_used": False,
+        }
+        candidate = p0.copy()
+        optimizer_success = False
+        iterations = 0
+        optimizer_message = "root/hybr did not run"
 
-        # Попытка 2: least_squares (LM, более робастный)
-        if not ans.success:
+        # Попытка 1: hybr (быстрый). Его success сохраняется как метаданные,
+        # но окончательное решение всё равно независимо перевычисляется ниже.
+        try:
+            root_result = root(
+                residual,
+                p0,
+                method="hybr",
+                tol=self.ds.eps,
+                options={"maxfev": 100 * len(p0)},
+            )
+            candidate = np.asarray(root_result.x, dtype=float)
+            optimizer_success = bool(root_result.success)
+            iterations = int(getattr(root_result, "nfev", 0))
+            optimizer_message = str(getattr(root_result, "message", ""))
+            solver_metadata["root"] = {
+                "success": optimizer_success,
+                "status": getattr(root_result, "status", None),
+                "message": optimizer_message,
+                "nfev": getattr(root_result, "nfev", None),
+            }
+        except IVPIntegrationError as exc:
+            solver_metadata["root"] = {
+                "success": False,
+                "message": str(exc),
+            }
+            return self._build_ivp_failure_result(
+                p=candidate,
+                method="shooting",
+                error=exc,
+                optimizer_success=False,
+                iterations=iterations,
+                solver_metadata=solver_metadata,
+            )
+        except Exception as exc:
+            optimizer_message = f"root/hybr raised {type(exc).__name__}: {exc}"
+            solver_metadata["root"] = {
+                "success": False,
+                "message": optimizer_message,
+            }
+
+        # Попытка 2: least_squares. Нормальное завершение оптимизатора не
+        # является критерием выполнения граничных условий.
+        if not optimizer_success:
+            solver_metadata["fallback_used"] = True
+            solver_metadata["optimizer"] = "least_squares"
             if callback:
                 callback("shooting", 0, "hybr не сошёлся, пробуем least_squares...")
             try:
-                ls_res = least_squares(
-                    residual, p0, ftol=self.ds.eps, xtol=self.ds.eps,
-                    gtol=self.ds.eps, max_nfev=5000 * len(p0)
+                ls_result = least_squares(
+                    residual,
+                    p0,
+                    ftol=self.ds.eps,
+                    xtol=self.ds.eps,
+                    gtol=self.ds.eps,
+                    max_nfev=5000 * len(p0),
                 )
-                if ls_res.success or ls_res.cost < self.ds.eps:
-                    ans = type('obj', (object,), {
-                        'success': True, 'x': ls_res.x,
-                        'fun': residual(ls_res.x),
-                        'nfev': ls_res.nfev, 'message': 'least_squares'
-                    })()
-            except Exception:
-                pass
+                candidate = np.asarray(ls_result.x, dtype=float)
+                optimizer_success = bool(ls_result.success)
+                iterations = int(getattr(ls_result, "nfev", 0))
+                optimizer_message = str(getattr(ls_result, "message", ""))
+                solver_metadata["least_squares"] = {
+                    "success": optimizer_success,
+                    "status": getattr(ls_result, "status", None),
+                    "message": optimizer_message,
+                    "cost": getattr(ls_result, "cost", None),
+                    "optimality": getattr(ls_result, "optimality", None),
+                    "nfev": getattr(ls_result, "nfev", None),
+                }
+            except IVPIntegrationError as exc:
+                solver_metadata["least_squares"] = {
+                    "success": False,
+                    "message": str(exc),
+                }
+                return self._build_ivp_failure_result(
+                    p=candidate,
+                    method="shooting",
+                    error=exc,
+                    optimizer_success=False,
+                    iterations=iterations,
+                    solver_metadata=solver_metadata,
+                )
+            except Exception as exc:
+                optimizer_message = (
+                    f"least_squares raised {type(exc).__name__}: {exc}"
+                )
+                solver_metadata["least_squares"] = {
+                    "success": False,
+                    "message": optimizer_message,
+                }
 
-        if not ans.success:
-            raise RuntimeError(f"Метод стрельбы не сошёлся: {ans.message}")
-
-        p_opt = ans.x
-        sol = self._solve_ivp(p_opt, [self.ds.t_star, self.ds.T], dense_output=True)
+        result = self._validate_final_candidate(
+            p=candidate,
+            optimizer_success=optimizer_success,
+            algorithm_success=optimizer_success,
+            method="shooting",
+            iterations=iterations,
+            solver_metadata=solver_metadata,
+            failure_status="optimizer_failed" if not optimizer_success else None,
+            failure_message=(
+                f"Shooting optimizer did not converge: {optimizer_message}"
+                if not optimizer_success
+                else None
+            ),
+        )
 
         if callback:
-            callback("shooting", 100, "Готово!")
-
-        return {
-            "success": True,
-            "p_opt": p_opt,
-            "t": sol.t,
-            "y": sol.y,
-            "sol": sol,
-            "method": "shooting",
-            "iterations": getattr(ans, "nfev", -1),
-            "residual_norm": float(norm(ans.fun)),
-        }
+            if result["success"]:
+                callback("shooting", 100, "Готово: решение прошло проверку границы.")
+            else:
+                callback("shooting", 100, f"Отклонено: {result['message']}")
+        return result
 
     # ------------------------------------------------------------------
     # 3.2 Метод продолжения по параметру
@@ -628,91 +1019,260 @@ class BVPSolver:
         """
         p0 = np.array(self.ds.guess, dtype=float)
         N = self.ds.continuation_steps
+        p = p0.copy()
+        total_newton = 0
+        solver_metadata: Dict[str, Any] = {
+            "continuation_steps": N,
+            "max_newton_iterations": 20,
+            "steps": [],
+            "failure_step": None,
+            "failure_reason": None,
+        }
 
         # Φ(p₀) — начальная невязка
-        Phi_p0 = self._Phi(p0)
+        try:
+            Phi_p0 = self._Phi(p0)
+        except IVPIntegrationError as exc:
+            return self._build_ivp_failure_result(
+                p=p0,
+                method="continuation",
+                error=exc,
+                optimizer_success=False,
+                iterations=0,
+                solver_metadata=solver_metadata,
+            )
 
         if callback:
-            callback("continuation", 0,
-                     f"Начало продолжения: ‖Φ(p₀)‖={norm(Phi_p0):.4e}")
+            callback(
+                "continuation",
+                0,
+                f"Начало продолжения: ‖Φ(p₀)‖={norm(Phi_p0):.4e}",
+            )
 
-        # Проверяем, не случайно p₀ уже решение
-        if norm(Phi_p0) < self.ds.eps:
-            sol = self._solve_ivp(p0, [self.ds.t_star, self.ds.T], dense_output=True)
-            return {
-                "success": True, "p_opt": p0,
-                "t": sol.t, "y": sol.y, "sol": sol,
-                "method": "continuation", "iterations": 0,
-                "residual_norm": float(norm(Phi_p0)),
-            }
+        if not np.isfinite(Phi_p0).all():
+            return self._validate_final_candidate(
+                p=p0,
+                optimizer_success=False,
+                algorithm_success=False,
+                method="continuation",
+                iterations=0,
+                solver_metadata=solver_metadata,
+                failure_status="non_finite_result",
+                failure_message="Initial continuation residual contains NaN or Inf.",
+            )
 
-        p = p0.copy()
-        dmu = 1.0 / N
-        total_newton = 0
+        # Проверяем, не является ли p₀ уже допустимым решением.
+        if norm(Phi_p0) <= self.ds.boundary_atol:
+            return self._validate_final_candidate(
+                p=p0,
+                optimizer_success=True,
+                algorithm_success=True,
+                method="continuation",
+                iterations=0,
+                solver_metadata=solver_metadata,
+            )
+
+        failure_status: Optional[str] = None
+        failure_message: Optional[str] = None
 
         for step in range(1, N + 1):
             mu = step / N
-            # Промежуточная цель: Φ(p) = (1-μ)·Φ(p₀)
             target = (1.0 - mu) * Phi_p0
+            step_metadata: Dict[str, Any] = {
+                "step": step,
+                "mu": mu,
+                "newton_converged": False,
+                "jacobian_success": None,
+                "damping_success": None,
+                "newton_updates": 0,
+                "residual_norm": None,
+                "failure_reason": None,
+            }
 
-            # Newton: решаем Φ(p) = target, стартуя с текущего p
-            for newton_iter in range(20):
-                Phi_current = self._Phi(p)
+            for _newton_iter in range(20):
+                try:
+                    Phi_current = self._Phi(p)
+                except IVPIntegrationError as exc:
+                    step_metadata["failure_reason"] = str(exc)
+                    solver_metadata["steps"].append(step_metadata)
+                    solver_metadata["failure_step"] = step
+                    solver_metadata["failure_reason"] = str(exc)
+                    return self._build_ivp_failure_result(
+                        p=p,
+                        method="continuation",
+                        error=exc,
+                        optimizer_success=False,
+                        iterations=total_newton,
+                        solver_metadata=solver_metadata,
+                    )
+
                 residual = Phi_current - target
-                res_norm = norm(residual)
-                if res_norm < self.ds.eps:
+                res_norm = float(norm(residual))
+                step_metadata["residual_norm"] = res_norm
+                if not np.isfinite(p).all() or not np.isfinite(residual).all():
+                    failure_status = "non_finite_result"
+                    failure_message = (
+                        f"Continuation step {step} at mu={mu:.6g} produced NaN or Inf."
+                    )
+                    step_metadata["failure_reason"] = failure_message
+                    break
+                if res_norm <= self.ds.eps:
+                    step_metadata["newton_converged"] = True
                     break
 
                 try:
                     dPhi = self._dPhi_dp(p)
-                    delta = np_solve(dPhi, residual)
-                except np.linalg.LinAlgError:
-                    delta = np.linalg.lstsq(dPhi, residual, rcond=None)[0]
-                except Exception:
+                    step_metadata["jacobian_success"] = bool(
+                        np.isfinite(dPhi).all()
+                        and dPhi.shape == (len(residual), len(p))
+                    )
+                    if not step_metadata["jacobian_success"]:
+                        raise ValueError(
+                            f"invalid Jacobian shape or values: {dPhi.shape}"
+                        )
+                    try:
+                        delta = np_solve(dPhi, residual)
+                    except np.linalg.LinAlgError:
+                        delta = np.linalg.lstsq(dPhi, residual, rcond=None)[0]
+                    if not np.isfinite(delta).all():
+                        raise ValueError("Newton update contains NaN or Inf")
+                except IVPIntegrationError as exc:
+                    step_metadata["jacobian_success"] = False
+                    step_metadata["failure_reason"] = str(exc)
+                    solver_metadata["steps"].append(step_metadata)
+                    solver_metadata["failure_step"] = step
+                    solver_metadata["failure_reason"] = str(exc)
+                    return self._build_ivp_failure_result(
+                        p=p,
+                        method="continuation",
+                        error=exc,
+                        optimizer_success=False,
+                        iterations=total_newton,
+                        solver_metadata=solver_metadata,
+                    )
+                except Exception as exc:
+                    step_metadata["jacobian_success"] = False
+                    failure_status = "continuation_failed"
+                    failure_message = (
+                        f"Continuation Jacobian failed at step {step}, mu={mu:.6g}: "
+                        f"{type(exc).__name__}: {exc}"
+                    )
+                    step_metadata["failure_reason"] = failure_message
                     break
 
-                # Демпфирование
-                p_try = p - delta
-                Phi_try = self._Phi(p_try)
-                if norm(Phi_try - target) < res_norm:
-                    p = p_try
-                else:
-                    for factor in [0.5, 0.25, 0.125, 0.0625]:
-                        p_damp = p - factor * delta
-                        Phi_damp = self._Phi(p_damp)
-                        if norm(Phi_damp - target) < res_norm:
-                            p = p_damp
-                            break
-                    else:
-                        break  # демпфирование не помогло — переходим к след. μ
+                accepted_update = False
+                for factor in (1.0, 0.5, 0.25, 0.125, 0.0625):
+                    p_try = p - factor * delta
+                    if not np.isfinite(p_try).all():
+                        continue
+                    try:
+                        Phi_try = self._Phi(p_try)
+                    except IVPIntegrationError as exc:
+                        step_metadata["damping_success"] = False
+                        step_metadata["failure_reason"] = str(exc)
+                        solver_metadata["steps"].append(step_metadata)
+                        solver_metadata["failure_step"] = step
+                        solver_metadata["failure_reason"] = str(exc)
+                        return self._build_ivp_failure_result(
+                            p=p_try,
+                            method="continuation",
+                            error=exc,
+                            optimizer_success=False,
+                            iterations=total_newton,
+                            solver_metadata=solver_metadata,
+                        )
+                    candidate_residual = Phi_try - target
+                    if (
+                        np.isfinite(candidate_residual).all()
+                        and norm(candidate_residual) < res_norm
+                    ):
+                        p = p_try
+                        accepted_update = True
+                        step_metadata["damping_success"] = True
+                        step_metadata["newton_updates"] += 1
+                        total_newton += 1
+                        break
 
-                total_newton += 1
+                if not accepted_update:
+                    step_metadata["damping_success"] = False
+                    failure_status = "continuation_failed"
+                    failure_message = (
+                        f"Continuation damping failed at step {step}, mu={mu:.6g}; "
+                        "no tested step reduced the homotopy residual."
+                    )
+                    step_metadata["failure_reason"] = failure_message
+                    break
 
-            # Прогресс
+            if not step_metadata["newton_converged"] and failure_message is None:
+                try:
+                    final_step_residual = self._Phi(p) - target
+                    final_step_norm = float(norm(final_step_residual))
+                    step_metadata["residual_norm"] = final_step_norm
+                    step_metadata["newton_converged"] = bool(
+                        np.isfinite(final_step_residual).all()
+                        and final_step_norm <= self.ds.eps
+                    )
+                except IVPIntegrationError as exc:
+                    step_metadata["failure_reason"] = str(exc)
+                    solver_metadata["steps"].append(step_metadata)
+                    solver_metadata["failure_step"] = step
+                    solver_metadata["failure_reason"] = str(exc)
+                    return self._build_ivp_failure_result(
+                        p=p,
+                        method="continuation",
+                        error=exc,
+                        optimizer_success=False,
+                        iterations=total_newton,
+                        solver_metadata=solver_metadata,
+                    )
+
+            if not step_metadata["newton_converged"]:
+                if failure_message is None:
+                    failure_status = "continuation_failed"
+                    failure_message = (
+                        f"Continuation Newton did not converge within 20 iterations "
+                        f"at step {step}, mu={mu:.6g}; residual_norm="
+                        f"{step_metadata['residual_norm']}."
+                    )
+                    step_metadata["failure_reason"] = failure_message
+                solver_metadata["steps"].append(step_metadata)
+                solver_metadata["failure_step"] = step
+                solver_metadata["failure_reason"] = failure_message
+                break
+
+            solver_metadata["steps"].append(step_metadata)
             if callback and step % max(1, N // 10) == 0:
                 progress = int(100 * step / N)
-                Phi_current = self._Phi(p)
-                callback("continuation", progress,
-                         f"Шаг {step}/{N}: ‖Φ‖={norm(Phi_current):.4e}")
+                callback(
+                    "continuation",
+                    progress,
+                    f"Шаг {step}/{N}: ‖Φ-target‖="
+                    f"{step_metadata['residual_norm']:.4e}",
+                )
 
-        # Итоговое решение
-        sol = self._solve_ivp(p, [self.ds.t_star, self.ds.T], dense_output=True)
-        Phi_opt = self._Phi(p)
+        algorithm_success = failure_message is None
+        result = self._validate_final_candidate(
+            p=p,
+            optimizer_success=algorithm_success,
+            algorithm_success=algorithm_success,
+            method="continuation",
+            iterations=total_newton,
+            solver_metadata=solver_metadata,
+            failure_status=failure_status,
+            failure_message=failure_message,
+        )
 
         if callback:
-            callback("continuation", 100,
-                     f"Готово! Newton: {total_newton}, ‖Φ‖={norm(Phi_opt):.4e}")
-
-        return {
-            "success": True,
-            "p_opt": p,
-            "t": sol.t,
-            "y": sol.y,
-            "sol": sol,
-            "method": "continuation",
-            "iterations": total_newton,
-            "residual_norm": float(norm(Phi_opt)),
-        }
+            if result["success"]:
+                callback(
+                    "continuation",
+                    100,
+                    f"Готово! Newton: {total_newton}, "
+                    f"‖Φ‖={result['boundary_residual_norm']:.4e}",
+                )
+            else:
+                callback("continuation", 100, f"Отклонено: {result['message']}")
+        return result
 
     def solve(self, callback: Optional[Callable] = None) -> dict:
         """Диспетчер: выбирает метод в соответствии с Dataset."""
@@ -1546,6 +2106,7 @@ class BvpSolverApp(QMainWindow):
 
         # Хранение результатов
         self.last_result: Optional[dict] = None
+        self.last_failed_result: Optional[dict] = None
         self.all_results: List[dict] = []
         self._task_status: Dict[int, str] = {}  # task_idx -> "solved" | "error"
 
@@ -2168,11 +2729,28 @@ class BvpSolverApp(QMainWindow):
     def _on_solve_done(self, result: dict):
         t = self.TRANSLATIONS[self.current_lang]
         self.btn_solve.setEnabled(True)
-        self.last_result = result
+
+        if not is_result_acceptable(result):
+            self.last_result = None
+            self.last_failed_result = result
+            self.progress_bar_label.setStyleSheet(
+                "background-color: #e74c3c; color: white; "
+                "padding: 4px 8px; border-radius: 4px; font-weight: bold;"
+            )
+            self.progress_bar_label.setText(t["status_error"])
+            diagnostic = self._format_failed_result(result)
+            self.progress_detail.setText(diagnostic)
+            if self.current_task_idx >= 0:
+                self._task_status[self.current_task_idx] = "error"
+                self._refresh_task_table()
+            QMessageBox.warning(self, "BVP result rejected", diagnostic)
+            return
 
         # --- 计算辅助输出变量 ---
         result = self._compute_aux_outputs(result)
 
+        self.last_failed_result = None
+        self.last_result = result
         self.all_results.append(result)
 
         # --- 构建完整的 x(0) 状态向量 ---
@@ -2202,6 +2780,38 @@ class BvpSolverApp(QMainWindow):
             self._task_status[self.current_task_idx] = "solved"
             self._refresh_task_table()
         QMessageBox.information(self, "Result", msg)
+
+    @staticmethod
+    def _format_failed_result(result: dict) -> str:
+        residual = np.asarray(result.get("boundary_residual", []), dtype=float)
+        residual_text = np.array2string(residual, precision=6, separator=", ")
+        residual_norm = result.get("boundary_residual_norm", float("inf"))
+        boundary_atol = result.get("boundary_atol", "unknown")
+        metadata = result.get("solver_metadata", {})
+        diagnostic_keys = (
+            "optimizer",
+            "fallback_used",
+            "root",
+            "least_squares",
+            "failure_step",
+            "failure_reason",
+        )
+        metadata_summary = {
+            key: metadata[key] for key in diagnostic_keys if key in metadata
+        }
+        return (
+            f"method: {result.get('method', 'unknown')}\n"
+            f"status: {result.get('status', 'unknown')}\n"
+            f"message: {result.get('message', 'No diagnostic message')}\n"
+            f"optimizer_success: {result.get('optimizer_success', False)}\n"
+            f"ivp_success: {result.get('ivp_success', False)}\n"
+            f"finite_success: {result.get('finite_success', False)}\n"
+            f"boundary_success: {result.get('boundary_success', False)}\n"
+            f"boundary_residual: {residual_text}\n"
+            f"boundary_residual_norm: {residual_norm}\n"
+            f"boundary_atol: {boundary_atol}\n"
+            f"solver_metadata: {metadata_summary}"
+        )
 
     def _build_full_state(self, p_opt: np.ndarray) -> np.ndarray:
         """从 p_opt 和 known 值构建完整的 x(0) 状态向量."""
@@ -2304,26 +2914,29 @@ class BvpSolverApp(QMainWindow):
 
     def on_plot(self):
         t = self.TRANSLATIONS[self.current_lang]
-        if not self.all_results:
+        valid_results = [
+            result for result in self.all_results if is_result_acceptable(result)
+        ]
+        if not valid_results:
             QMessageBox.warning(self, "Warning", t["err_no_solution"])
             return
 
         var_names = self.eq_editor.get_var_names()
         # 收集所有辅助变量名（去重）
         aux_names_set = set()
-        for r in self.all_results:
+        for r in valid_results:
             aux_names_set.update(r.get("aux_names", []))
         aux_names = sorted(aux_names_set)
         if hasattr(self, '_plot_widget') and self._plot_widget is not None:
             try:
-                self._plot_widget.update_data(var_names, self.all_results, aux_names, lang=self.current_lang)
+                self._plot_widget.update_data(var_names, valid_results, aux_names, lang=self.current_lang)
                 self._plot_widget.show()
                 self._plot_widget.raise_()
                 self._plot_widget.activateWindow()
                 return
             except RuntimeError:
                 self._plot_widget = None
-        self._plot_widget = IntegratedPlotWidget(var_names, self.all_results, aux_names, lang=self.current_lang, parent=self)
+        self._plot_widget = IntegratedPlotWidget(var_names, valid_results, aux_names, lang=self.current_lang, parent=self)
         self._plot_widget.show()
         self._plot_widget.raise_()
         self._plot_widget.activateWindow()
@@ -2562,7 +3175,7 @@ class BvpSolverApp(QMainWindow):
 
     def on_export(self):
         t = self.TRANSLATIONS[self.current_lang]
-        if self.last_result is None:
+        if self.last_result is None or not is_result_acceptable(self.last_result):
             QMessageBox.warning(self, "Warning", t["err_no_solution"])
             return
 
@@ -2606,6 +3219,7 @@ class BvpSolverApp(QMainWindow):
         reply = QMessageBox.question(self, "Confirm", t["confirm_clear"])
         if reply == QMessageBox.Yes:
             self.last_result = None
+            self.last_failed_result = None
             self.all_results = []
             self._task_status.clear()
             self._refresh_task_table()

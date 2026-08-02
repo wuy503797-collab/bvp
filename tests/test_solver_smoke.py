@@ -59,8 +59,16 @@ def test_main_continuation_two_body_matches_independent_boundary_check() -> None
     result = solver.solve()
 
     assert result["success"] is True
+    assert result["status"] == "success"
     assert result["method"] == "continuation"
     assert result["sol"].success is True
+    assert result["ivp_success"] is True
+    assert result["optimizer_success"] is True
+    assert result["algorithm_success"] is True
+    assert result["finite_success"] is True
+    assert result["boundary_success"] is True
+    assert result["boundary_atol"] == BOUNDARY_TOL
+    assert result["boundary_rtol"] == 0.0
     assert result["y"].shape[0] == dataset.dim()
     assert result["y"].shape[1] == result["t"].size
     assert np.isfinite(result["p_opt"]).all()
@@ -74,6 +82,15 @@ def test_main_continuation_two_body_matches_independent_boundary_check() -> None
     assert boundary_residual.shape == (dataset.num_unknown(),)
     assert np.isfinite(boundary_residual).all()
     assert boundary_residual_norm <= BOUNDARY_TOL
+    np.testing.assert_allclose(
+        result["boundary_residual"], boundary_residual, rtol=1e-6, atol=1e-12
+    )
+    np.testing.assert_allclose(
+        result["boundary_residual_norm"],
+        boundary_residual_norm,
+        rtol=1e-6,
+        atol=1e-12,
+    )
     np.testing.assert_allclose(
         result["residual_norm"], boundary_residual_norm, rtol=1e-6, atol=1e-12
     )
