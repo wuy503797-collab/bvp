@@ -6,7 +6,7 @@ import os
 import sys
 import time
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any, Callable, Mapping
 
 import numpy as np
 
@@ -17,75 +17,67 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
-from main import BVPSolver, Dataset, SymPyParser
+from bvp_core import BVPProblem, SolverConfig, solve_bvp_problem
 from validation_metrics import sample_dense_solution, validate_numerical_solution
 
 
-def _build_solver(dataset: Dataset) -> BVPSolver:
-    parser = SymPyParser(dataset.equations, dataset.var_names)
-    parser.lambdify_all()
-    return BVPSolver(dataset, parser)
-
-
-def _exponential_dataset(method: str, eps: float = 1e-8) -> Dataset:
-    return Dataset(
-        name=f"Scalar exponential ({method}, eps={eps:g})",
-        equations=["x"],
+def _exponential_problem() -> BVPProblem:
+    return BVPProblem(
+        name="Scalar exponential",
+        odes=["x"],
         var_names=["x"],
-        T=1.0,
-        initial_values={0: None},
         boundary_conditions=["x0_T - E"],
-        guess=[0.5],
-        eps=eps,
-        boundary_atol=1e-8,
-        method="RK45",
-        solver_method=method,
-        continuation_steps=10,
         known_indices=[],
         unknown_indices=[0],
-        t_star=0.0,
+        known_values={},
+        initial_guess=[0.5],
+        t_start=0.0,
+        t_end=1.0,
     )
 
 
-def _oscillator_dataset() -> Dataset:
-    return Dataset(
+def _oscillator_problem() -> BVPProblem:
+    return BVPProblem(
         name="Harmonic oscillator",
-        equations=["v", "-x"],
+        odes=["v", "-x"],
         var_names=["x", "v"],
-        T=float(np.pi / 2.0),
-        initial_values={0: 0.0, 1: None},
         boundary_conditions=["x0_T - 1"],
-        guess=[0.8],
-        eps=1e-8,
-        boundary_atol=1e-8,
-        method="RK45",
-        solver_method="shooting",
         known_indices=[0],
         unknown_indices=[1],
-        t_star=0.0,
+        known_values={0: 0.0},
+        initial_guess=[0.8],
+        t_start=0.0,
+        t_end=float(np.pi / 2.0),
     )
 
 
-def _manufactured_dataset() -> Dataset:
-    return Dataset(
+def _manufactured_problem() -> BVPProblem:
+    return BVPProblem(
         name="Manufactured cubic polynomial",
-        equations=["v", "6*t"],
+        odes=["v", "6*t"],
         var_names=["y", "v"],
-        T=1.0,
-        initial_values={0: 1.0, 1: None},
         boundary_conditions=["x0_T"],
-        guess=[-1.0],
-        eps=1e-8,
-        boundary_atol=1e-8,
-        method="RK45",
-        solver_method="shooting",
         known_indices=[0],
         unknown_indices=[1],
-        t_star=0.0,
+        known_values={0: 1.0},
+        initial_guess=[-1.0],
+        t_start=0.0,
+        t_end=1.0,
     )
 
 
-def _metadata_summary(metadata: dict[str, Any]) -> dict[str, Any]:
+def _solver_config(method: str, eps: float = 1e-8) -> SolverConfig:
+    return SolverConfig(
+        method=method,
+        ivp_method="RK45",
+        eps=eps,
+        boundary_atol=1e-8,
+        boundary_rtol=0.0,
+        continuation_steps=10,
+    )
+
+
+def _metadata_summary(metadata: Mapping[str, Any]) -> dict[str, Any]:
     summary = {
         key: metadata[key]
         for key in ("optimizer", "fallback_used", "failure_step", "failure_reason")
@@ -102,58 +94,53 @@ def _metadata_summary(metadata: dict[str, Any]) -> dict[str, Any]:
 
 def _run_case(
     label: str,
-    dataset: Dataset,
+    problem: BVPProblem,
+    config: SolverConfig,
     exact_solution: Callable[[np.ndarray], np.ndarray],
     p_exact: np.ndarray,
+    ode_function: Callable[[float, np.ndarray], np.ndarray],
+    initial_state_from_parameters: Callable[[np.ndarray], np.ndarray],
+    boundary_function: Callable[[np.ndarray, np.ndarray], np.ndarray],
 ) -> dict[str, Any]:
-    errors = dataset.validate()
-    if errors:
-        return {
-            "case": label,
-            "success": False,
-            "status": "validation_error",
-            "message": "; ".join(errors),
-        }
-
-    solver = _build_solver(dataset)
     started = time.perf_counter()
-    result = solver.solve()
+    result = solve_bvp_problem(problem, config)
     elapsed = time.perf_counter() - started
-    if not result["success"]:
+    plain_metadata = result.to_dict()["solver_metadata"]
+    if not result.success:
         return {
             "case": label,
-            "configured_eps": dataset.eps,
+            "configured_eps": config.eps,
             "success": False,
-            "status": result["status"],
-            "message": result["message"],
-            "p_opt": result["p_opt"],
+            "status": result.status,
+            "message": result.message,
+            "p_opt": result.p_opt,
             "elapsed_seconds": elapsed,
-            "solver_metadata": _metadata_summary(result["solver_metadata"]),
+            "solver_metadata": _metadata_summary(plain_metadata),
         }
 
     validation_t, validation_y = sample_dense_solution(
-        result["sol"].sol,
-        (dataset.t_star, dataset.T),
+        result.sol.sol,
+        (problem.t_start, problem.t_end),
         sample_count=201,
     )
     metrics = validate_numerical_solution(
         t=validation_t,
         numerical_y=validation_y,
-        p_opt=result["p_opt"],
+        p_opt=result.p_opt,
         p_exact=p_exact,
         exact_solution=exact_solution,
-        ode_function=solver.parser.f,
-        initial_state_from_parameters=solver._p_to_state,
-        boundary_function=solver.bc_residual,
-        dense_solution=result["sol"].sol,
+        ode_function=ode_function,
+        initial_state_from_parameters=initial_state_from_parameters,
+        boundary_function=boundary_function,
+        dense_solution=result.sol.sol,
     )
     return {
         "case": label,
-        "method": dataset.solver_method,
-        "configured_eps": dataset.eps,
-        "success": bool(result["success"]),
-        "status": result["status"],
-        "p_opt": result["p_opt"],
+        "method": config.method,
+        "configured_eps": config.eps,
+        "success": bool(result.success),
+        "status": result.status,
+        "p_opt": result.p_opt,
         "p_exact": p_exact,
         "parameter_error": metrics["parameter_error"],
         "max_abs_error": metrics["max_abs_error"],
@@ -170,7 +157,7 @@ def _run_case(
         "all_finite": metrics["all_finite"],
         "validation_sample_count": int(validation_t.size),
         "elapsed_seconds": elapsed,
-        "solver_metadata": _metadata_summary(result["solver_metadata"]),
+        "solver_metadata": _metadata_summary(plain_metadata),
         "_validation_y": validation_y,
     }
 
@@ -203,35 +190,64 @@ def _case_passes(case: dict[str, Any], *, max_state_error: float) -> bool:
 
 def main() -> int:
     exponential_exact = lambda t: np.exp(t)[np.newaxis, :]
+    exponential_ode = lambda _t, state: np.array([state[0]])
+    exponential_initial = lambda parameters: np.array([parameters[0]])
+    exponential_boundary = lambda _initial, terminal: np.array(
+        [terminal[0] - np.e]
+    )
     oscillator_exact = lambda t: np.vstack((np.sin(t), np.cos(t)))
+    oscillator_ode = lambda _t, state: np.array([state[1], -state[0]])
+    oscillator_initial = lambda parameters: np.array([0.0, parameters[0]])
+    oscillator_boundary = lambda _initial, terminal: np.array(
+        [terminal[0] - 1.0]
+    )
     manufactured_exact = lambda t: np.vstack(
         (t**3 - 2.0 * t + 1.0, 3.0 * t**2 - 2.0)
     )
+    manufactured_ode = lambda time, state: np.array([state[1], 6.0 * time])
+    manufactured_initial = lambda parameters: np.array([1.0, parameters[0]])
+    manufactured_boundary = lambda _initial, terminal: np.array([terminal[0]])
 
     cases = [
         _run_case(
             "analytic exponential shooting",
-            _exponential_dataset("shooting"),
+            _exponential_problem(),
+            _solver_config("shooting"),
             exponential_exact,
             np.array([1.0]),
+            exponential_ode,
+            exponential_initial,
+            exponential_boundary,
         ),
         _run_case(
             "analytic exponential continuation",
-            _exponential_dataset("continuation"),
+            _exponential_problem(),
+            _solver_config("continuation"),
             exponential_exact,
             np.array([1.0]),
+            exponential_ode,
+            exponential_initial,
+            exponential_boundary,
         ),
         _run_case(
             "analytic harmonic oscillator shooting",
-            _oscillator_dataset(),
+            _oscillator_problem(),
+            _solver_config("shooting"),
             oscillator_exact,
             np.array([1.0]),
+            oscillator_ode,
+            oscillator_initial,
+            oscillator_boundary,
         ),
         _run_case(
             "manufactured cubic shooting",
-            _manufactured_dataset(),
+            _manufactured_problem(),
+            _solver_config("shooting"),
             manufactured_exact,
             np.array([-2.0]),
+            manufactured_ode,
+            manufactured_initial,
+            manufactured_boundary,
         ),
     ]
     for case in cases:
@@ -256,9 +272,13 @@ def main() -> int:
     tolerance_runs = [
         _run_case(
             f"eps={eps:g}",
-            _exponential_dataset("shooting", eps=eps),
+            _exponential_problem(),
+            _solver_config("shooting", eps=eps),
             exponential_exact,
             np.array([1.0]),
+            exponential_ode,
+            exponential_initial,
+            exponential_boundary,
         )
         for eps in (1e-4, 1e-6, 1e-8)
     ]
@@ -278,15 +298,23 @@ def main() -> int:
 
     repeat_first = _run_case(
         "repeat 1",
-        _exponential_dataset("shooting"),
+        _exponential_problem(),
+        _solver_config("shooting"),
         exponential_exact,
         np.array([1.0]),
+        exponential_ode,
+        exponential_initial,
+        exponential_boundary,
     )
     repeat_second = _run_case(
         "repeat 2",
-        _exponential_dataset("shooting"),
+        _exponential_problem(),
+        _solver_config("shooting"),
         exponential_exact,
         np.array([1.0]),
+        exponential_ode,
+        exponential_initial,
+        exponential_boundary,
     )
     repeatable = bool(
         repeat_first.get("success")

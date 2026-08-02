@@ -62,6 +62,61 @@ python main.py
 
 程序启动后通过“加载”按钮选择仓库中的任务 JSON，例如 `task1.json` 或 `tasks.json`。
 
+## 无 GUI 核心 API
+
+脚本和测试可通过 `bvp_core` 使用稳定的输入、配置和结果模型，无需创建
+`QApplication`、窗口、图形或输出文件：
+
+```python
+from bvp_core import BVPProblem, SolverConfig, solve_bvp_problem
+
+problem = BVPProblem(
+    name="Scalar exponential",
+    odes=["x"],
+    var_names=["x"],
+    boundary_conditions=["x0_T - E"],
+    known_indices=[],
+    unknown_indices=[0],
+    known_values={},
+    initial_guess=[0.5],
+    t_start=0.0,
+    t_end=1.0,
+)
+config = SolverConfig(
+    method="shooting",
+    ivp_method="RK45",
+    eps=1e-8,
+    boundary_atol=1e-8,
+    boundary_rtol=0.0,
+)
+result = solve_bvp_problem(problem, config)
+
+if result.success:
+    print(result.p_opt, result.boundary_residual_norm)
+else:
+    print(result.status, result.message)
+```
+
+`BVPProblem` 只描述数学问题，`SolverConfig` 只描述当前实现实际使用的
+求解控制。两者以及 `BVPResult` 均不会被求解过程原地修改；结果数组是只读副本，
+旧字典消费者可显式调用 `result.to_dict()` 获得防御性副本。问题定义或配置错误会在
+数值求解前抛出 `BVPValidationError`；预期内的数值失败则返回
+`BVPResult(success=False)`，并保留状态、IVP 诊断和最终边界残差。
+
+导入 `bvp_core` 本身不会导入 `main.py` 或启动 Qt。现阶段实际求解仍通过一个明确的
+兼容适配层复用 `main.py` 中已经验证的 `SymPyParser` 和 `BVPSolver`，但不会创建 GUI。
+`Dataset` 暂时保留为 JSON/GUI 兼容输入层，`BVPResult` 是新代码推荐的结果接口，旧
+结果字典由 `to_dict()` 暂时保留。这保持了第三阶段数值基线，同时为后续把算法实现
+移出 GUI 模块提供稳定边界。GUI 仍是当前桌面用户入口，公共 API 仍处于迭代阶段。
+
+### 过渡性技术债务
+
+`solve_bvp_problem()` 在真正求解时仍会延迟导入并复用 `main.py` 中的
+`SymPyParser` 和 `BVPSolver`。导入 `bvp_core` 本身没有 GUI 副作用，也没有循环导入，
+因此不影响第四阶段验收；但当前核心包还不是解析与求解实现完全独立的核心包。
+第五阶段只处理 GUI 生命周期，不应继续扩大这条依赖；计划在第六阶段迁移解析器和
+求解器，并由 `main.py` 反向消费独立核心实现。
+
 ## 自动化测试
 
 ```bash
@@ -72,7 +127,14 @@ python -m pytest -q
 
 - 正向数值基线：确认当前 26.1 双体问题仍能得到有限结果和合格的终端边界残差；
 - 正确性回归：确认无解问题被拒绝、IVP 失败被传播、输入维数被提前验证；
+- 核心 API：确认模型不可变、结果数组防御性复制、无窗口导入、失败语义和旧接口兼容；
 - 数值验证：用解析解和制造解检查未知参数、全部状态、边界条件和 ODE 积分缺陷。
+
+单独运行核心 API 测试：
+
+```bash
+python -m pytest -v tests/core
+```
 
 单独运行数值验证测试：
 

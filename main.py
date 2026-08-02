@@ -174,68 +174,19 @@ class Dataset:
         return len(self.unknown_indices)
 
     def validate(self) -> List[str]:
-        """Возвращает список ошибок валидации (пустой = ОК)."""
-        errors = []
-        n = self.dim()
-        if n == 0:
-            errors.append("Уравнения не заданы")
-        if not self.boundary_conditions:
-            errors.append("Граничные условия не заданы")
-        if len(self.initial_values) != n:
-            errors.append(
-                f"Начальные значения: задано {len(self.initial_values)}, "
-                f"ожидается {n}"
-            )
-        if not self.unknown_indices:
-            errors.append("Нет неизвестных начальных условий (unknown_indices пуст)")
-        if len(self.boundary_conditions) != len(self.unknown_indices):
-            errors.append(
-                "Input validation: boundary condition count is "
-                f"{len(self.boundary_conditions)}, but unknown initial parameter "
-                f"count is {len(self.unknown_indices)}; the shooting root system "
-                "requires these counts to be equal."
-            )
-        if len(self.guess) != len(self.unknown_indices):
-            errors.append(
-                f"Приближение: guess={len(self.guess)}, "
-                f"неизвестных={len(self.unknown_indices)}"
-            )
-        valid_index_types = (int, np.integer)
-        invalid_known = [
-            idx
-            for idx in self.known_indices
-            if not isinstance(idx, valid_index_types) or not 0 <= idx < n
-        ]
-        invalid_unknown = [
-            idx
-            for idx in self.unknown_indices
-            if not isinstance(idx, valid_index_types) or not 0 <= idx < n
-        ]
-        if invalid_known:
-            errors.append(
-                f"Input validation: known_indices out of range for dimension {n}: "
-                f"{invalid_known}"
-            )
-        if invalid_unknown:
-            errors.append(
-                f"Input validation: unknown_indices out of range for dimension {n}: "
-                f"{invalid_unknown}"
-            )
-        overlap = sorted(set(self.known_indices) & set(self.unknown_indices))
-        if overlap:
-            errors.append(
-                "Input validation: known_indices and unknown_indices overlap at "
-                f"{overlap}; every initial-state index must have exactly one role."
-            )
-        if not np.isfinite(self.boundary_atol) or self.boundary_atol <= 0:
-            errors.append("Input validation: boundary_atol must be finite and positive")
-        if not np.isfinite(self.boundary_rtol) or self.boundary_rtol < 0:
-            errors.append("Input validation: boundary_rtol must be finite and non-negative")
-        if self.solver_method == "continuation" and self.continuation_steps < 1:
-            errors.append(
-                "Input validation: continuation_steps must be at least 1 for "
-                "the continuation solver"
-            )
+        """Return core-model validation errors while preserving the legacy list API."""
+        from bvp_core.adapters import config_from_dataset, problem_from_dataset
+        from bvp_core.models import BVPValidationError
+
+        errors: List[str] = []
+        try:
+            problem_from_dataset(self)
+        except BVPValidationError as exc:
+            errors.extend(exc.errors)
+        try:
+            config_from_dataset(self)
+        except BVPValidationError as exc:
+            errors.extend(exc.errors)
         return errors
 
 
