@@ -140,6 +140,79 @@ else:
 外部表达式现在必须通过下述受限数学语言边界；这不是“安全执行任意 SymPy/Python
 表达式”的承诺。取消仍采用协作式检查点；单次正在执行的 `solve_ivp` 不能被立即中断。
 
+## 容差配置
+
+核心 API 将不同数值过程的容差分开处理：
+
+- `ivp_rtol`、`ivp_atol` 传给 `solve_ivp`，控制内部自适应积分的局部误差估计；
+- `root_tol` 传给 `scipy.optimize.root`，控制根求解终止；
+- `least_squares_ftol`、`least_squares_xtol`、`least_squares_gtol` 分别传给
+  `scipy.optimize.least_squares` 的对应终止条件；
+- `continuation_residual_tol` 是参数延拓各 Newton 子问题的残差收敛门槛；
+- `jacobian_relative_step` 控制现有参数有限差分 Jacobian 的相对扰动基值；
+- `boundary_atol`、`boundary_rtol` 和 `boundary_scales` 只控制最终边界验收，不改变
+  原始边界残差，也不作为优化权重。
+
+为兼容旧 Python 调用和任务 JSON，`eps` 暂时保留。只提供 `eps` 时，有效映射为：
+
+```text
+ivp_rtol                    = eps
+ivp_atol                    = eps / 10
+root_tol                    = eps
+least_squares_ftol          = eps
+least_squares_xtol          = eps
+least_squares_gtol          = eps
+continuation_residual_tol   = eps
+jacobian_relative_step      = sqrt(eps)
+```
+
+显式字段只覆盖自己的过程，其他缺省字段仍从 `eps` 推导。例如
+`SolverConfig(eps=1e-6, ivp_rtol=1e-8)` 不会改变 `ivp_atol=1e-7` 或
+`root_tol=1e-6`。若 `eps=None`，上述八个过程字段必须全部显式给出。所有容差必须为
+正有限数；`boundary_rtol` 可为零。有效值、逐字段来源和整体
+`tolerance_mode=legacy|explicit` 会写入结果元数据。GUI 的基础“精度”输入暂时仍创建
+legacy 模式；高级显式配置通过 JSON 或 Python API 提供。
+
+全显式配置示例：
+
+```python
+config = SolverConfig(
+    method="shooting",
+    eps=None,
+    ivp_rtol=1e-8,
+    ivp_atol=1e-9,
+    root_tol=1e-8,
+    least_squares_ftol=1e-8,
+    least_squares_xtol=1e-8,
+    least_squares_gtol=1e-8,
+    continuation_residual_tol=1e-8,
+    jacobian_relative_step=1e-4,
+    boundary_atol=1e-8,
+    boundary_rtol=0.0,
+)
+```
+
+最终边界验收逐分量计算：
+
+```text
+threshold_i = boundary_atol + boundary_rtol * boundary_scales_i
+component_success_i = abs(residual_i) <= threshold_i
+boundary_success = all(component_success_i)
+```
+
+`boundary_scales` 未提供时每个分量取 `1.0`；提供时长度必须等于边界条件数量，且每项
+为正有限数。程序不会从残差当前值、优化器 cost 或状态幅值自动推断尺度。结果继续保留
+`boundary_residual_norm`，并新增尺度、阈值、逐分量状态、尺度化比值及其最大值。优化器
+成功仍不等于 BVP 成功，算法、IVP、有限性和最终边界验收必须同时有效。
+
+输出或验证用的固定采样点不是 `solve_ivp` 的内部自适应网格。收紧某一容差也不保证
+观测误差或函数评估次数严格单调变化；它们还会受到其他误差源、算法分支和浮点平台影响。
+可运行独立的 legacy/explicit 等价性、过程独立性、尺度化验收和 JSON 兼容检查：
+
+```bash
+python scripts/run_tolerance_validation.py
+```
+
 ## 自动化测试
 
 ```bash
@@ -265,7 +338,10 @@ D_i = y(t_{i+1}) - y(t_i)
 | 1e-6 | 1.56e-7 | 2.82e-7 | 1.24e-7 | 4.44e-16 | 3.28e-8 |
 | 1e-8 | 2.02e-9 | 5.28e-9 | 1.78e-9 | 4.44e-16 | 1.16e-9 |
 
-`eps` 同时影响 IVP 和非线性求解过程，所以这里只称为容差敏感性实验；它不是内部网格收敛实验，也不用于拟合理论收敛阶。浮点舍入和 dense output 误差会形成误差平台。
+这张历史表使用 legacy 模式，所以 `eps` 按上述兼容映射同时影响 IVP、非线性求解、
+延拓残差和 Jacobian 扰动。它只是一项容差敏感性实验，不是内部网格收敛实验，也不用于
+拟合理论收敛阶；浮点舍入和 dense output 误差会形成误差平台，更严格的容差也不保证
+误差严格单调下降。
 
 ## 当前正向数值基线
 

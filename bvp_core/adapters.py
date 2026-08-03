@@ -65,7 +65,7 @@ def problem_from_dataset(dataset: Any) -> BVPProblem:
 
 
 def config_from_dataset(dataset: Any) -> SolverConfig:
-    """Convert legacy solver controls without changing current eps semantics."""
+    """Convert legacy and explicit controls through the sole config resolver."""
     return SolverConfig(
         method=dataset.solver_method,
         ivp_method=dataset.method,
@@ -73,6 +73,17 @@ def config_from_dataset(dataset: Any) -> SolverConfig:
         boundary_atol=dataset.boundary_atol,
         boundary_rtol=dataset.boundary_rtol,
         continuation_steps=dataset.continuation_steps,
+        ivp_rtol=getattr(dataset, "ivp_rtol", None),
+        ivp_atol=getattr(dataset, "ivp_atol", None),
+        root_tol=getattr(dataset, "root_tol", None),
+        least_squares_ftol=getattr(dataset, "least_squares_ftol", None),
+        least_squares_xtol=getattr(dataset, "least_squares_xtol", None),
+        least_squares_gtol=getattr(dataset, "least_squares_gtol", None),
+        continuation_residual_tol=getattr(
+            dataset, "continuation_residual_tol", None
+        ),
+        jacobian_relative_step=getattr(dataset, "jacobian_relative_step", None),
+        boundary_scales=getattr(dataset, "boundary_scales", None),
     )
 
 
@@ -96,6 +107,27 @@ def dataset_kwargs(problem: BVPProblem, config: SolverConfig) -> dict[str, Any]:
         "eps": config.eps,
         "boundary_atol": config.boundary_atol,
         "boundary_rtol": config.boundary_rtol,
+        "boundary_scales": (
+            None if config.boundary_scales is None else list(config.boundary_scales)
+        ),
+        "ivp_rtol": config.explicit_tolerance_value("ivp_rtol"),
+        "ivp_atol": config.explicit_tolerance_value("ivp_atol"),
+        "root_tol": config.explicit_tolerance_value("root_tol"),
+        "least_squares_ftol": config.explicit_tolerance_value(
+            "least_squares_ftol"
+        ),
+        "least_squares_xtol": config.explicit_tolerance_value(
+            "least_squares_xtol"
+        ),
+        "least_squares_gtol": config.explicit_tolerance_value(
+            "least_squares_gtol"
+        ),
+        "continuation_residual_tol": config.explicit_tolerance_value(
+            "continuation_residual_tol"
+        ),
+        "jacobian_relative_step": config.explicit_tolerance_value(
+            "jacobian_relative_step"
+        ),
         "method": config.ivp_method,
         "solver_method": config.method,
         "continuation_steps": config.continuation_steps,

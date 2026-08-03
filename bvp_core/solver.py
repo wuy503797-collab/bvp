@@ -15,6 +15,7 @@ from .exceptions import IVPIntegrationError
 from .expressions import SymPyParser
 from .models import BVPProblem, SolverConfig
 from .requests import SolveCancelled
+from .tolerances import ResolvedTolerances, evaluate_boundary_acceptance
 
 
 @dataclass(frozen=True)
@@ -29,9 +30,7 @@ class _SolverInputs:
     initial_values: dict[int, float | None]
     boundary_conditions: tuple[str, ...]
     guess: tuple[float, ...]
-    eps: float
-    boundary_atol: float
-    boundary_rtol: float
+    tolerances: ResolvedTolerances
     method: str
     solver_method: str
     continuation_steps: int
@@ -57,9 +56,9 @@ class _SolverInputs:
             },
             boundary_conditions=problem.boundary_conditions,
             guess=problem.initial_guess,
-            eps=config.eps,
-            boundary_atol=config.boundary_atol,
-            boundary_rtol=config.boundary_rtol,
+            tolerances=config.effective_tolerances(
+                boundary_count=len(problem.boundary_conditions)
+            ),
             method=config.ivp_method,
             solver_method=config.method,
             continuation_steps=config.continuation_steps,
@@ -101,6 +100,7 @@ class BVPSolver:
         self.problem = problem
         self.config = config
         self.ds = _SolverInputs.from_models(problem, config)
+        self.tolerances = self.ds.tolerances
         self.parser = parser or SymPyParser(list(problem.odes), list(problem.var_names))
         self.bc_residual = SymPyParser.parse_boundary_conditions(
             list(problem.boundary_conditions), list(problem.var_names)
@@ -147,7 +147,8 @@ class BVPSolver:
                 self.parser.f, t_span, x0,
                 method=self.ds.method,
                 dense_output=dense_output,
-                rtol=self.ds.eps, atol=self.ds.eps / 10,
+                rtol=self.tolerances.ivp_rtol,
+                atol=self.tolerances.ivp_atol,
             )
         except Exception as exc:
             raise IVPIntegrationError(
@@ -218,11 +219,27 @@ class BVPSolver:
             float(norm(residual)) if residual_available and np.isfinite(residual).all()
             else float("inf")
         )
+        boundary_count = len(self.ds.boundary_conditions)
+        acceptance_residual = (
+            residual
+            if residual_available and residual.size == boundary_count
+            else np.full(boundary_count, np.nan, dtype=float)
+        )
+        boundary_check = evaluate_boundary_acceptance(
+            acceptance_residual,
+            boundary_atol=self.tolerances.boundary_atol,
+            boundary_rtol=self.tolerances.boundary_rtol,
+            boundary_scales=self.tolerances.boundary_scales,
+        )
+        finite_success = bool(
+            finite_success
+            and residual.size == boundary_count
+            and boundary_check.finite
+        )
         boundary_success = bool(
             ivp_success
             and finite_success
-            and residual.size == len(self.ds.boundary_conditions)
-            and residual_norm <= self.ds.boundary_atol
+            and boundary_check.success
         )
         success = bool(
             ivp_success
@@ -239,8 +256,8 @@ class BVPSolver:
             status = "success"
             message = (
                 "Validated BVP solution: final boundary residual norm "
-                f"{residual_norm:.6e} <= boundary_atol "
-                f"{self.ds.boundary_atol:.6e}."
+                f"{residual_norm:.6e}; maximum scaled component ratio "
+                f"{boundary_check.max_scaled_ratio:.6e} <= 1."
             )
         elif not ivp_success:
             status = "ivp_failed"
@@ -261,13 +278,18 @@ class BVPSolver:
             status = "boundary_residual_too_large"
             message = failure_message or (
                 "The optimizer terminated, but the final boundary residual did not "
-                f"meet acceptance: {residual_norm:.6e} > boundary_atol "
-                f"{self.ds.boundary_atol:.6e}."
+                "meet component-wise acceptance; maximum scaled ratio="
+                f"{boundary_check.max_scaled_ratio:.6e} > 1."
             )
         else:
             status = failure_status or "optimizer_failed"
             message = failure_message or "The BVP result did not pass final acceptance."
 
+        metadata = dict(solver_metadata or {})
+        # Effective values are authoritative and cannot be shadowed by
+        # algorithm-specific metadata assembled along the solve path.
+        metadata.update(self.tolerances.to_metadata())
+        metadata["boundary_thresholds"] = boundary_check.thresholds.tolist()
         return {
             "success": success,
             "status": status,
@@ -287,10 +309,18 @@ class BVPSolver:
             "boundary_success": boundary_success,
             "boundary_residual": residual,
             "boundary_residual_norm": residual_norm,
-            "boundary_atol": float(self.ds.boundary_atol),
-            "boundary_rtol": float(self.ds.boundary_rtol),
-            "boundary_acceptance": "l2_norm <= boundary_atol",
-            "solver_metadata": dict(solver_metadata or {}),
+            "boundary_atol": float(self.tolerances.boundary_atol),
+            "boundary_rtol": float(self.tolerances.boundary_rtol),
+            "boundary_scales": boundary_check.scales,
+            "boundary_thresholds": boundary_check.thresholds,
+            "boundary_component_success": boundary_check.component_success,
+            "boundary_scaled_ratios": boundary_check.scaled_ratios,
+            "boundary_max_scaled_ratio": boundary_check.max_scaled_ratio,
+            "boundary_acceptance": (
+                "abs(residual_i) <= boundary_atol + boundary_rtol * "
+                "boundary_scales_i"
+            ),
+            "solver_metadata": metadata,
             "iterations": int(iterations),
             # Backward-compatible alias used by the GUI and phase-one tests.
             "residual_norm": residual_norm,
@@ -443,7 +473,8 @@ class BVPSolver:
             sol = solve_ivp(
                 combined_ode, [self.ds.t_star, T], y0,
                 method="RK45",
-                rtol=max(1e-6, self.ds.eps), atol=max(1e-8, self.ds.eps / 100),
+                rtol=self.tolerances.jacobian_ivp_rtol,
+                atol=self.tolerances.jacobian_ivp_atol,
                 dense_output=False,
             )
             self._check_cancelled()
@@ -451,7 +482,7 @@ class BVPSolver:
                 yT = sol.y[:, -1]
                 XT = yT[n:].reshape(n, n)
                 # dΦ/dp через вариации + численное дифференцирование BC
-                eps_jac = max(1e-7, self.ds.eps ** 0.5)
+                eps_jac = max(1e-7, self.tolerances.jacobian_relative_step)
                 jac_matrix = np.zeros((m, k))
                 for j in range(k):
                     p_perturb = p.copy()
@@ -481,7 +512,9 @@ class BVPSolver:
         m = len(Phi_base)
 
         # Адаптивный шаг
-        eps_jac = max(1e-7, min(1e-4, self.ds.eps ** 0.5))
+        eps_jac = max(
+            1e-7, min(1e-4, self.tolerances.jacobian_relative_step)
+        )
         jac_matrix = np.zeros((m, k))
         for j in range(k):
             self._check_cancelled()
@@ -552,7 +585,7 @@ class BVPSolver:
                 residual,
                 p0,
                 method="hybr",
-                tol=self.ds.eps,
+                tol=self.tolerances.root_tol,
                 options={"maxfev": 100 * len(p0)},
             )
             self._check_cancelled()
@@ -600,9 +633,9 @@ class BVPSolver:
                 ls_result = least_squares(
                     residual,
                     p0,
-                    ftol=self.ds.eps,
-                    xtol=self.ds.eps,
-                    gtol=self.ds.eps,
+                    ftol=self.tolerances.least_squares_ftol,
+                    xtol=self.tolerances.least_squares_xtol,
+                    gtol=self.tolerances.least_squares_gtol,
                     max_nfev=5000 * len(p0),
                 )
                 self._check_cancelled()
@@ -728,7 +761,13 @@ class BVPSolver:
             )
 
         # Проверяем, не является ли p₀ уже допустимым решением.
-        if norm(Phi_p0) <= self.ds.boundary_atol:
+        initial_boundary_check = evaluate_boundary_acceptance(
+            Phi_p0,
+            boundary_atol=self.tolerances.boundary_atol,
+            boundary_rtol=self.tolerances.boundary_rtol,
+            boundary_scales=self.tolerances.boundary_scales,
+        )
+        if initial_boundary_check.success:
             return self._validate_final_candidate(
                 p=p0,
                 optimizer_success=True,
@@ -786,7 +825,7 @@ class BVPSolver:
                     )
                     step_metadata["failure_reason"] = failure_message
                     break
-                if res_norm <= self.ds.eps:
+                if res_norm <= self.tolerances.continuation_residual_tol:
                     step_metadata["newton_converged"] = True
                     break
 
@@ -885,7 +924,8 @@ class BVPSolver:
                     step_metadata["residual_norm"] = final_step_norm
                     step_metadata["newton_converged"] = bool(
                         np.isfinite(final_step_residual).all()
-                        and final_step_norm <= self.ds.eps
+                        and final_step_norm
+                        <= self.tolerances.continuation_residual_tol
                     )
                 except IVPIntegrationError as exc:
                     step_metadata["failure_reason"] = str(exc)

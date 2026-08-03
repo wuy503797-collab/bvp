@@ -47,6 +47,8 @@ def solve_bvp_problem(
         )
     except ExpressionValidationError:
         raise
+    except BVPValidationError:
+        raise
     except (TypeError, ValueError, SyntaxError) as exc:
         raise BVPValidationError(
             f"Problem expression validation failed: {type(exc).__name__}: {exc}"

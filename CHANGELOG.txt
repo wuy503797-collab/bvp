@@ -1,6 +1,15 @@
 CHANGELOG
 =========
 
+v2.7 (2026-08)
+- 将 IVP、root、least_squares、延拓 Newton、参数 Jacobian 和最终边界验收容差拆分为显式语义
+- 保留旧 eps 与旧 JSON，并在唯一解析入口按原映射补全未显式提供的过程容差
+- 支持部分覆盖和 eps=None 的全显式 Python/JSON 配置，记录有效值、来源和 legacy/explicit 模式
+- 最终边界验收改为 boundary_atol + boundary_rtol * boundary_scales 的逐分量判据，不自动推断问题尺度
+- 结果新增边界尺度、阈值、逐分量状态、尺度化比值和最大比值只读诊断
+- GUI 基础精度控件保持 legacy 模式，失败显示和 JSON 导出增加有效容差与边界诊断
+- 新增容差映射、过程独立性、legacy/explicit 数值等价和 JSON 兼容测试及终端验收脚本
+
 v2.6 (2026-08)
 - 将 GUI/JSON 外部表达式统一收口到受限 AST-to-SymPy 解析入口，不再使用 parse_expr 或自动创建未知对象
 - 为 ODE、边界条件、辅助输出和 GUI 标量初值建立独立符号上下文

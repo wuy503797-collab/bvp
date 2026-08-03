@@ -15,6 +15,12 @@ def _readonly_vector(value: Any) -> np.ndarray:
     return array
 
 
+def _readonly_bool_vector(value: Any) -> np.ndarray:
+    array = np.array([] if value is None else value, dtype=bool, copy=True).reshape(-1)
+    array.setflags(write=False)
+    return array
+
+
 def _readonly_state_matrix(value: Any) -> np.ndarray:
     array = np.array([] if value is None else value, dtype=float, copy=True)
     if array.size == 0:
@@ -87,9 +93,24 @@ class BVPResult:
     boundary_residual_norm: float = float("inf")
     boundary_atol: float = 1e-8
     boundary_rtol: float = 0.0
+    boundary_scales: np.ndarray = field(
+        default_factory=lambda: np.array([], dtype=float)
+    )
+    boundary_thresholds: np.ndarray = field(
+        default_factory=lambda: np.array([], dtype=float)
+    )
+    boundary_component_success: np.ndarray = field(
+        default_factory=lambda: np.array([], dtype=bool)
+    )
+    boundary_scaled_ratios: np.ndarray = field(
+        default_factory=lambda: np.array([], dtype=float)
+    )
+    boundary_max_scaled_ratio: float | None = None
     iterations: int = 0
     solver_metadata: Mapping[str, Any] = field(default_factory=dict)
-    boundary_acceptance: str = "l2_norm <= boundary_atol"
+    boundary_acceptance: str = (
+        "abs(residual_i) <= boundary_atol + boundary_rtol * boundary_scales_i"
+    )
     raw_solution: Any | None = field(default=None, repr=False, compare=False)
 
     def __post_init__(self) -> None:
@@ -105,6 +126,38 @@ class BVPResult:
         object.__setattr__(
             self, "boundary_residual", _readonly_vector(self.boundary_residual)
         )
+        residual = self.boundary_residual
+        scales = _readonly_vector(self.boundary_scales)
+        if residual.size and not scales.size:
+            scales = _readonly_vector(np.ones(residual.size, dtype=float))
+        thresholds = _readonly_vector(self.boundary_thresholds)
+        if residual.size and not thresholds.size:
+            thresholds = _readonly_vector(
+                float(self.boundary_atol) + float(self.boundary_rtol) * scales
+            )
+        component_success = _readonly_bool_vector(self.boundary_component_success)
+        if residual.size and not component_success.size:
+            component_success = _readonly_bool_vector(
+                np.isfinite(residual) & (np.abs(residual) <= thresholds)
+            )
+        ratios = _readonly_vector(self.boundary_scaled_ratios)
+        if residual.size and not ratios.size:
+            ratios = _readonly_vector(
+                np.where(np.isfinite(residual), np.abs(residual) / thresholds, np.inf)
+            )
+        for name, array in (
+            ("boundary_scales", scales),
+            ("boundary_thresholds", thresholds),
+            ("boundary_component_success", component_success),
+            ("boundary_scaled_ratios", ratios),
+        ):
+            if residual.size and array.size != residual.size:
+                raise ValueError(f"{name} must match boundary_residual length")
+            object.__setattr__(self, name, array)
+        maximum = self.boundary_max_scaled_ratio
+        if maximum is None:
+            maximum = float(np.max(ratios)) if ratios.size else float("inf")
+        object.__setattr__(self, "boundary_max_scaled_ratio", float(maximum))
         object.__setattr__(
             self, "solver_metadata", _freeze_metadata(self.solver_metadata)
         )
@@ -142,6 +195,11 @@ class BVPResult:
             "boundary_residual_norm": self.boundary_residual_norm,
             "boundary_atol": self.boundary_atol,
             "boundary_rtol": self.boundary_rtol,
+            "boundary_scales": self.boundary_scales.copy(),
+            "boundary_thresholds": self.boundary_thresholds.copy(),
+            "boundary_component_success": self.boundary_component_success.copy(),
+            "boundary_scaled_ratios": self.boundary_scaled_ratios.copy(),
+            "boundary_max_scaled_ratio": self.boundary_max_scaled_ratio,
             "boundary_acceptance": self.boundary_acceptance,
             "iterations": self.iterations,
             "solver_metadata": _thaw_metadata(self.solver_metadata),
@@ -178,10 +236,19 @@ class BVPResult:
             boundary_residual_norm=boundary_norm,
             boundary_atol=float(data.get("boundary_atol", 1e-8)),
             boundary_rtol=float(data.get("boundary_rtol", 0.0)),
+            boundary_scales=data.get("boundary_scales"),
+            boundary_thresholds=data.get("boundary_thresholds"),
+            boundary_component_success=data.get("boundary_component_success"),
+            boundary_scaled_ratios=data.get("boundary_scaled_ratios"),
+            boundary_max_scaled_ratio=data.get("boundary_max_scaled_ratio"),
             iterations=int(data.get("iterations", 0)),
             solver_metadata=data.get("solver_metadata", {}),
             boundary_acceptance=str(
-                data.get("boundary_acceptance", "l2_norm <= boundary_atol")
+                data.get(
+                    "boundary_acceptance",
+                    "abs(residual_i) <= boundary_atol + boundary_rtol * "
+                    "boundary_scales_i",
+                )
             ),
             raw_solution=data.get("sol"),
         )

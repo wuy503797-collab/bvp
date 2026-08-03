@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import os
 from threading import Event
 from types import SimpleNamespace
@@ -105,6 +106,18 @@ def _successful_result(state_value: float = 1.0) -> BVPResult:
         boundary_success=True,
         boundary_residual=np.array([0.0]),
         boundary_residual_norm=0.0,
+        solver_metadata={
+            "tolerance_mode": "legacy",
+            "legacy_eps": 1e-8,
+            "effective_ivp_rtol": 1e-8,
+            "effective_ivp_atol": 1e-9,
+            "effective_root_tol": 1e-8,
+            "effective_least_squares_ftol": 1e-8,
+            "effective_least_squares_xtol": 1e-8,
+            "effective_least_squares_gtol": 1e-8,
+            "effective_continuation_residual_tol": 1e-8,
+            "effective_jacobian_relative_step": 1e-4,
+        },
     )
 
 
@@ -182,6 +195,96 @@ def test_gui_builds_request_from_one_editor_snapshot(window) -> None:
     assert request.task_name == "GUI snapshot"
     assert request.problem.odes == ("0",)
     assert request.auxiliary_expressions == {"double": "2*x"}
+
+
+def test_basic_gui_eps_input_builds_legacy_effective_tolerances(window) -> None:
+    dataset = _dataset("Legacy GUI")
+    dataset.eps = 1e-6
+    window.tasks = [dataset]
+    window._task_ids = ["legacy-gui"]
+    window.current_task_idx = 0
+    window._sync_task_to_editor(dataset)
+
+    request = window._build_solve_request()
+
+    assert request.config.tolerance_mode == "legacy"
+    assert request.config.ivp_rtol == 1e-6
+    assert request.config.ivp_atol == 1e-7
+    assert request.config.root_tol == 1e-6
+
+
+def test_fully_explicit_json_configuration_survives_gui_snapshot(window) -> None:
+    raw = _dataset("Explicit GUI").to_dict()
+    raw.update(
+        {
+            "eps": None,
+            "ivp_rtol": 2e-8,
+            "ivp_atol": 3e-9,
+            "root_tol": 4e-8,
+            "least_squares_ftol": 5e-8,
+            "least_squares_xtol": 6e-8,
+            "least_squares_gtol": 7e-8,
+            "continuation_residual_tol": 8e-8,
+            "jacobian_relative_step": 9e-5,
+            "boundary_scales": [10.0],
+        }
+    )
+    dataset = Dataset.from_dict(raw)
+    window.tasks = [dataset]
+    window._task_ids = ["explicit-gui"]
+    window.current_task_idx = 0
+    window._sync_task_to_editor(dataset)
+
+    request = window._build_solve_request()
+
+    assert request.config.eps is None
+    assert request.config.tolerance_mode == "explicit"
+    assert request.config.ivp_rtol == 2e-8
+    assert request.config.boundary_scales == (10.0,)
+
+
+def test_invalid_explicit_tolerance_does_not_start_worker(window, monkeypatch) -> None:
+    dataset = _dataset("Invalid tolerance")
+    dataset.ivp_rtol = 0.0
+    window.tasks = [dataset]
+    window._task_ids = ["invalid-tolerance"]
+    window.current_task_idx = 0
+    window._sync_task_to_editor(dataset)
+    warnings = []
+    monkeypatch.setattr(
+        QMessageBox,
+        "warning",
+        lambda _parent, title, message: warnings.append((title, message)),
+    )
+
+    assert window.on_solve() is False
+    assert window.active_worker is None
+    assert "ivp_rtol" in " ".join(str(item) for row in warnings for item in row)
+
+
+def test_incomplete_eps_none_configuration_does_not_fall_back_to_gui_eps(
+    window, monkeypatch
+) -> None:
+    dataset = _dataset("Incomplete explicit tolerance")
+    dataset.eps = None
+    dataset.ivp_rtol = 1e-8
+    window.tasks = [dataset]
+    window._task_ids = ["incomplete-explicit"]
+    window.current_task_idx = 0
+    window._sync_task_to_editor(dataset)
+    warnings = []
+    monkeypatch.setattr(
+        QMessageBox,
+        "warning",
+        lambda _parent, title, message: warnings.append((title, message)),
+    )
+
+    assert window.on_solve() is False
+    assert dataset.eps is None
+    assert window.active_worker is None
+    assert "eps=None requires explicit values" in " ".join(
+        str(item) for row in warnings for item in row
+    )
 
 
 def test_dangerous_ode_is_rejected_before_worker_creation(window, monkeypatch) -> None:
@@ -335,6 +438,25 @@ def test_failed_and_cancelled_outcomes_never_enter_success_history(window) -> No
     assert window.solve_state is GuiSolveState.CANCELLED
 
 
+def test_failed_result_diagnostic_displays_effective_tolerances_and_thresholds() -> None:
+    result = _failed_result().to_dict()
+    result["solver_metadata"].update(
+        {
+            "tolerance_mode": "explicit",
+            "effective_ivp_rtol": 2e-8,
+            "effective_ivp_atol": 3e-9,
+            "effective_root_tol": 4e-8,
+        }
+    )
+
+    diagnostic = BvpSolverApp._format_failed_result(result)
+
+    assert "tolerance_mode" in diagnostic
+    assert "effective_ivp_rtol" in diagnostic
+    assert "boundary_thresholds" in diagnostic
+    assert "boundary_max_scaled_ratio" in diagnostic
+
+
 def test_cancel_request_wins_at_auxiliary_checkpoint(window) -> None:
     request = _request("cancel-before-aux", auxiliary="2*x")
     _activate(window, request)
@@ -478,6 +600,25 @@ def test_dangerous_auxiliary_expression_is_isolated_after_primary_solve(window) 
     assert record.auxiliary_outputs == {}
     assert len(record.auxiliary_errors) == 1
     assert "forbidden_name" in record.auxiliary_errors[0]
+
+
+def test_json_export_contains_effective_tolerances_and_boundary_thresholds(
+    window, monkeypatch, tmp_path
+) -> None:
+    record = _complete(window, _request("export-tolerances"))
+    export_path = tmp_path / "result.json"
+    monkeypatch.setattr(
+        "main.QFileDialog.getSaveFileName",
+        lambda *_args, **_kwargs: (str(export_path), "JSON (*.json)"),
+    )
+
+    window.on_export()
+
+    exported = json.loads(export_path.read_text(encoding="utf-8"))
+    assert exported["tolerances"]["tolerance_mode"] == "legacy"
+    assert exported["tolerances"]["effective_ivp_rtol"] == 1e-8
+    assert exported["boundary_acceptance"]["thresholds"] == [1e-8]
+    assert exported["boundary_acceptance"]["max_scaled_ratio"] == 0.0
 
 
 def test_close_event_cooperatively_cancels_and_joins_worker(window) -> None:

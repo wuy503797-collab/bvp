@@ -198,42 +198,127 @@ class BVPProblem:
 
 @dataclass(frozen=True)
 class SolverConfig:
-    """Solver controls that map exactly to the current legacy implementation."""
+    """Immutable user controls with one-time legacy tolerance resolution."""
 
     method: str = "continuation"
     ivp_method: str = "RK45"
-    eps: float = 1e-8
+    eps: float | None = 1e-8
     boundary_atol: float = 1e-8
     boundary_rtol: float = 0.0
     continuation_steps: int = 50
+    ivp_rtol: float | None = None
+    ivp_atol: float | None = None
+    root_tol: float | None = None
+    least_squares_ftol: float | None = None
+    least_squares_xtol: float | None = None
+    least_squares_gtol: float | None = None
+    continuation_residual_tol: float | None = None
+    jacobian_relative_step: float | None = None
+    boundary_scales: tuple[float, ...] | list[float] | None = None
+    _explicit_tolerance_fields: frozenset[str] = field(
+        default_factory=frozenset, init=False, repr=False
+    )
+    _tolerance_sources: Mapping[str, str] = field(
+        default_factory=dict, init=False, repr=False, compare=False
+    )
 
     def __post_init__(self) -> None:
+        def numeric_value(name: str, value: Any, *, optional: bool = False):
+            if optional and value is None:
+                return None
+            try:
+                return float(value)
+            except (TypeError, ValueError) as exc:
+                raise BVPValidationError(
+                    f"Input validation: {name} must be numeric and finite; "
+                    f"actual={value!r}"
+                ) from exc
+
+        eps = numeric_value("legacy eps", self.eps, optional=True)
+        boundary_atol = numeric_value("boundary_atol", self.boundary_atol)
+        boundary_rtol = numeric_value("boundary_rtol", self.boundary_rtol)
+        raw_process = {
+            name: numeric_value(name, getattr(self, name), optional=True)
+            for name in (
+                "ivp_rtol",
+                "ivp_atol",
+                "root_tol",
+                "least_squares_ftol",
+                "least_squares_xtol",
+                "least_squares_gtol",
+                "continuation_residual_tol",
+                "jacobian_relative_step",
+            )
+        }
         try:
-            eps = float(self.eps)
-            boundary_atol = float(self.boundary_atol)
-            boundary_rtol = float(self.boundary_rtol)
             continuation_steps = int(self.continuation_steps)
         except (TypeError, ValueError) as exc:
             raise BVPValidationError(
-                f"Solver configuration values must be numeric where required: {exc}"
+                "Input validation: continuation_steps must be an integer; "
+                f"actual={self.continuation_steps!r}"
             ) from exc
+        if self.boundary_scales is None:
+            boundary_scales = None
+        else:
+            try:
+                scale_values = tuple(self.boundary_scales)
+            except TypeError as exc:
+                raise BVPValidationError(
+                    "Input validation: boundary_scales must be a sequence of "
+                    f"positive finite numbers; actual={self.boundary_scales!r}"
+                ) from exc
+            boundary_scales = tuple(
+                numeric_value(f"boundary_scales[{index}]", value)
+                for index, value in enumerate(scale_values)
+            )
         object.__setattr__(self, "eps", eps)
         object.__setattr__(self, "boundary_atol", boundary_atol)
         object.__setattr__(self, "boundary_rtol", boundary_rtol)
         object.__setattr__(self, "continuation_steps", continuation_steps)
+        object.__setattr__(self, "boundary_scales", boundary_scales)
+        from .tolerances import (
+            resolve_process_tolerances,
+            validate_boundary_configuration,
+        )
+
+        resolved, sources = resolve_process_tolerances(eps=eps, values=raw_process)
+        for name, value in resolved.items():
+            object.__setattr__(self, name, value)
+        object.__setattr__(
+            self,
+            "_explicit_tolerance_fields",
+            frozenset(name for name, value in raw_process.items() if value is not None),
+        )
+        object.__setattr__(self, "_tolerance_sources", sources)
+        validate_boundary_configuration(
+            boundary_atol=boundary_atol,
+            boundary_rtol=boundary_rtol,
+            boundary_scales=boundary_scales,
+        )
         self.validate()
 
     @property
-    def ivp_rtol(self) -> float:
-        return self.eps
+    def tolerance_mode(self) -> str:
+        return (
+            "legacy"
+            if self.eps is not None
+            and not self._explicit_tolerance_fields
+            and self.boundary_scales is None
+            and self.boundary_rtol == 0.0
+            else "explicit"
+        )
 
     @property
-    def ivp_atol(self) -> float:
-        return self.eps / 10.0
+    def tolerance_sources(self) -> Mapping[str, str]:
+        return self._tolerance_sources
 
-    @property
-    def root_tol(self) -> float:
-        return self.eps
+    def explicit_tolerance_value(self, name: str) -> float | None:
+        return getattr(self, name) if name in self._explicit_tolerance_fields else None
+
+    def effective_tolerances(self, boundary_count: int = 0):
+        from .tolerances import build_resolved_tolerances
+
+        return build_resolved_tolerances(self, boundary_count)
 
     @property
     def max_newton_iterations(self) -> int:
@@ -254,12 +339,6 @@ class SolverConfig:
             "LSODA",
         }:
             errors.append(f"Input validation: unsupported IVP method {self.ivp_method!r}")
-        if not np.isfinite(self.eps) or self.eps <= 0:
-            errors.append("Input validation: legacy eps must be finite and positive")
-        if not np.isfinite(self.boundary_atol) or self.boundary_atol <= 0:
-            errors.append("Input validation: boundary_atol must be finite and positive")
-        if not np.isfinite(self.boundary_rtol) or self.boundary_rtol < 0:
-            errors.append("Input validation: boundary_rtol must be finite and non-negative")
         if self.continuation_steps < 1:
             errors.append("Input validation: continuation_steps must be at least 1")
         return errors

@@ -20,6 +20,7 @@ from .requests import (
 )
 from .results import BVPResult
 from .solver import BVPSolver
+from .tolerances import BoundaryAcceptance, ResolvedTolerances
 
 __all__ = [
     "BVPProblem",
@@ -27,11 +28,13 @@ __all__ = [
     "BVPSolver",
     "BVPValidationError",
     "CancellationToken",
+    "BoundaryAcceptance",
     "ExpressionContext",
     "ExpressionValidationError",
     "GuiSolveState",
     "IVPIntegrationError",
     "PlotCompatibility",
+    "ResolvedTolerances",
     "SolveCancelled",
     "SolveOutcome",
     "SolveOutcomeStatus",

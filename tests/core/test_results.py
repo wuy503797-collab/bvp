@@ -64,6 +64,10 @@ def test_result_arrays_are_read_only_and_to_dict_returns_copies() -> None:
     assert result.t.flags.writeable is False
     assert result.y.flags.writeable is False
     assert result.boundary_residual.flags.writeable is False
+    assert result.boundary_scales.flags.writeable is False
+    assert result.boundary_thresholds.flags.writeable is False
+    assert result.boundary_component_success.flags.writeable is False
+    assert result.boundary_scaled_ratios.flags.writeable is False
     with pytest.raises(ValueError):
         result.p_opt[0] = 2.0
 

@@ -83,6 +83,10 @@ from bvp_core.results import BVPResult
 
 LOGGER = logging.getLogger(__name__)
 
+
+def _optional_float(value: Any) -> Optional[float]:
+    return None if value is None else float(value)
+
 # ---------------------------------------------------------------------------
 # 1. Dataset — централизованное хранение параметров задачи
 # ---------------------------------------------------------------------------
@@ -107,12 +111,20 @@ class Dataset:
     # Начальное приближение для НЕИЗВЕСТНЫХ начальных значений (по порядку индексов)
     guess: List[float] = field(default_factory=list)
     # Параметры интегрирования
-    eps: float = 1e-8
+    eps: Optional[float] = 1e-8
     # Независимый критерий приёмки конечной граничной невязки.
-    # boundary_rtol зарезервирован для будущего масштабированного критерия;
-    # текущая проверка использует ||Phi||_2 <= boundary_atol.
+    # Финальная приёмка использует явные покомпонентные масштабы.
     boundary_atol: float = 1e-8
     boundary_rtol: float = 0.0
+    boundary_scales: Optional[List[float]] = None
+    ivp_rtol: Optional[float] = None
+    ivp_atol: Optional[float] = None
+    root_tol: Optional[float] = None
+    least_squares_ftol: Optional[float] = None
+    least_squares_xtol: Optional[float] = None
+    least_squares_gtol: Optional[float] = None
+    continuation_residual_tol: Optional[float] = None
+    jacobian_relative_step: Optional[float] = None
     method: str = "RK45"
     # Выбор метода решения: "shooting" | "continuation"
     solver_method: str = "continuation"
@@ -143,6 +155,17 @@ class Dataset:
             "eps": self.eps,
             "boundary_atol": self.boundary_atol,
             "boundary_rtol": self.boundary_rtol,
+            "boundary_scales": (
+                None if self.boundary_scales is None else list(self.boundary_scales)
+            ),
+            "ivp_rtol": self.ivp_rtol,
+            "ivp_atol": self.ivp_atol,
+            "root_tol": self.root_tol,
+            "least_squares_ftol": self.least_squares_ftol,
+            "least_squares_xtol": self.least_squares_xtol,
+            "least_squares_gtol": self.least_squares_gtol,
+            "continuation_residual_tol": self.continuation_residual_tol,
+            "jacobian_relative_step": self.jacobian_relative_step,
             "method": self.method,
             "solver_method": self.solver_method,
             "continuation_steps": self.continuation_steps,
@@ -174,9 +197,24 @@ class Dataset:
             initial_values=initial_values,
             boundary_conditions=list(d.get("boundary_conditions", [])),
             guess=list(d.get("guess", [])),
-            eps=float(d.get("eps", 1e-8)),
+            eps=None if d.get("eps", 1e-8) is None else float(d.get("eps", 1e-8)),
             boundary_atol=float(d.get("boundary_atol", 1e-8)),
             boundary_rtol=float(d.get("boundary_rtol", 0.0)),
+            boundary_scales=(
+                None
+                if d.get("boundary_scales") is None
+                else [float(value) for value in d["boundary_scales"]]
+            ),
+            ivp_rtol=_optional_float(d.get("ivp_rtol")),
+            ivp_atol=_optional_float(d.get("ivp_atol")),
+            root_tol=_optional_float(d.get("root_tol")),
+            least_squares_ftol=_optional_float(d.get("least_squares_ftol")),
+            least_squares_xtol=_optional_float(d.get("least_squares_xtol")),
+            least_squares_gtol=_optional_float(d.get("least_squares_gtol")),
+            continuation_residual_tol=_optional_float(
+                d.get("continuation_residual_tol")
+            ),
+            jacobian_relative_step=_optional_float(d.get("jacobian_relative_step")),
             method=d.get("method", "RK45"),
             solver_method=d.get("solver_method", "continuation"),
             continuation_steps=int(d.get("continuation_steps", 50)),
@@ -1301,7 +1339,7 @@ class BvpSolverApp(QMainWindow):
 
             # --- Параметры ---
             self.input_T.setValue(ds.T)
-            self.input_eps.setValue(ds.eps)
+            self.input_eps.setValue(1e-8 if ds.eps is None else ds.eps)
             self.combo_method.setCurrentText(ds.method)
             # solver_method
             idx = self.combo_solver.findData(ds.solver_method)
@@ -1365,7 +1403,11 @@ class BvpSolverApp(QMainWindow):
         ds.initial_values = iv
         ds.boundary_conditions = bcs
         ds.guess = guess
-        ds.eps = self.input_eps.value()
+        # The basic control edits legacy datasets.  An explicit JSON/API task keeps
+        # eps=None so an incomplete explicit configuration cannot be silently
+        # converted into a valid-looking legacy request.
+        if ds.eps is not None:
+            ds.eps = self.input_eps.value()
         ds.method = self.combo_method.currentText()
         ds.solver_method = self.combo_solver.currentData()
         ds.continuation_steps = self.input_steps.value()
@@ -2047,7 +2089,12 @@ class BvpSolverApp(QMainWindow):
             p_opt=p_opt_str,
             full_state=full_str,
         )
-        detail = f"‖Φ‖ = {result.residual_norm:.4e}; request_id={request_id}"
+        mode = result.solver_metadata.get("tolerance_mode", "unknown")
+        detail = (
+            f"‖Φ‖ = {result.residual_norm:.4e}; "
+            f"max_scaled_ratio={result.boundary_max_scaled_ratio:.4e}; "
+            f"tolerance_mode={mode}; request_id={request_id}"
+        )
         if aux_errors:
             detail += "; auxiliary warnings: " + " | ".join(aux_errors)
         self._set_gui_state(GuiSolveState.COMPLETED, detail)
@@ -2105,8 +2152,24 @@ class BvpSolverApp(QMainWindow):
         residual_text = np.array2string(residual, precision=6, separator=", ")
         residual_norm = result.get("boundary_residual_norm", float("inf"))
         boundary_atol = result.get("boundary_atol", "unknown")
+        boundary_rtol = result.get("boundary_rtol", "unknown")
+        thresholds = np.asarray(result.get("boundary_thresholds", []), dtype=float)
+        component_success = np.asarray(
+            result.get("boundary_component_success", []), dtype=bool
+        )
+        failed_components = np.flatnonzero(~component_success).tolist()
+        maximum_ratio = result.get("boundary_max_scaled_ratio", float("inf"))
         metadata = result.get("solver_metadata", {})
         diagnostic_keys = (
+            "tolerance_mode",
+            "legacy_eps",
+            "effective_ivp_rtol",
+            "effective_ivp_atol",
+            "effective_root_tol",
+            "effective_least_squares_ftol",
+            "effective_least_squares_xtol",
+            "effective_least_squares_gtol",
+            "effective_continuation_residual_tol",
             "optimizer",
             "fallback_used",
             "root",
@@ -2128,6 +2191,10 @@ class BvpSolverApp(QMainWindow):
             f"boundary_residual: {residual_text}\n"
             f"boundary_residual_norm: {residual_norm}\n"
             f"boundary_atol: {boundary_atol}\n"
+            f"boundary_rtol: {boundary_rtol}\n"
+            f"boundary_thresholds: {thresholds.tolist()}\n"
+            f"boundary_max_scaled_ratio: {maximum_ratio}\n"
+            f"failed_boundary_components: {failed_components}\n"
             f"solver_metadata: {metadata_summary}"
         )
 
@@ -2533,6 +2600,20 @@ class BvpSolverApp(QMainWindow):
         var_names = list(record.request.var_names)
 
         if path.endswith(".json"):
+            plain_result = result.to_dict()
+            metadata = plain_result["solver_metadata"]
+            tolerance_keys = (
+                "tolerance_mode",
+                "legacy_eps",
+                "effective_ivp_rtol",
+                "effective_ivp_atol",
+                "effective_root_tol",
+                "effective_least_squares_ftol",
+                "effective_least_squares_xtol",
+                "effective_least_squares_gtol",
+                "effective_continuation_residual_tol",
+                "effective_jacobian_relative_step",
+            )
             export_data = {
                 "request_id": record.request_id,
                 "source_task_id": record.request.source_task_id,
@@ -2540,6 +2621,19 @@ class BvpSolverApp(QMainWindow):
                 "method": result.method,
                 "iterations": result.iterations,
                 "residual_norm": result.residual_norm,
+                "tolerances": {
+                    key: metadata[key] for key in tolerance_keys if key in metadata
+                },
+                "boundary_acceptance": {
+                    "formula": result.boundary_acceptance,
+                    "atol": result.boundary_atol,
+                    "rtol": result.boundary_rtol,
+                    "scales": result.boundary_scales.tolist(),
+                    "thresholds": result.boundary_thresholds.tolist(),
+                    "component_success": result.boundary_component_success.tolist(),
+                    "scaled_ratios": result.boundary_scaled_ratios.tolist(),
+                    "max_scaled_ratio": result.boundary_max_scaled_ratio,
+                },
                 "p_opt": result.p_opt.tolist(),
                 "var_names": var_names,
                 "t": result.t.tolist(),
