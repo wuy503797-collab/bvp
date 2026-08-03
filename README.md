@@ -280,6 +280,49 @@ JSON、TXT 以及 GUI 任务库保存均采用同目标目录临时文件、flus
 python scripts/run_observability_validation.py
 ```
 
+## 性能计数与本机基准
+
+求解器为每次运行生成不可变 `performance_counters`，分别统计项目层 `Phi`、有限差分
+Jacobian、普通/最终验收 IVP、SciPy IVP `nfev`、root 与 least-squares 残差调用、延拓
+步、Newton 检查与更新以及阻尼试算。`RunMetadata.elapsed_seconds` 和
+`api_elapsed_seconds` 都表示公共 API 总时间；`core_elapsed_seconds` 只覆盖表达式已经准备
+完成后的数值求解与最终验收。GUI 线程调度、辅助输出、绘图和界面更新不属于这两个核心
+基准。输出的固定采样点也不是 `solve_ivp` 的内部自适应网格。
+
+第十阶段确认旧 `_dPhi_dp` 每次都积分状态变分矩阵 `XT`，但最终 Jacobian 完全由前向
+有限差分生成，`XT` 没有参与返回值。现已删除这段冗余变分积分；这不代表实现了解析
+Jacobian。当前参数 Jacobian 仍使用原来的前向扰动方向和步长。延拓还会把同一 Newton
+迭代刚计算的 `Phi_current` 作为显式局部基准传入，参数快照不一致时拒绝复用，不建立跨
+Newton 或跨运行缓存。固定延拓步数、Newton 上限和原有阻尼策略均未改变。
+
+最终验收仍独立执行一次 dense-output IVP 并重新计算边界残差。虽然某些路径可能刚计算过
+相同参数，这一步承担独立正确性验收，当前没有足够证据安全复用。每个公共 API 求解对
+ODE 的解析、lambdify 和边界编译各执行一次；没有建立跨任务全局表达式缓存。结果数组
+继续在 `BVPResult` 边界防御性复制并设为只读，未采用可能破坏不可变性的零复制技巧。
+默认日志级别未启用时，求解器会在构造结构化事件前短路；关键 INFO 事件和显式启用的
+DEBUG 事件保持原语义。
+
+在本仓库当前 Windows AMD64、Python 3.11.9、NumPy 2.4.4、SciPy 1.17.1、SymPy
+1.14.0 环境的一次同进程对比中，26.1 参数延拓的确定性统计为：
+
+```text
+                         修改前      修改后
+IVP 调用                    874         600
+总 IVP nfev              131732       94200
+Phi 评估                    736         599
+Jacobian 评估               137         137
+冗余变分 IVP                 137           0
+核心中位耗时（3 次）       0.956 s     0.617 s
+```
+
+时间只代表这一次机器与依赖组合，不是跨机器性能承诺，也不进入 pytest 的固定毫秒门槛。
+性能回归以调用次数不增加、数值数组等价和失败语义保持为主要判据。可运行预热后轻量案例
+5 次、26.1 延拓 3 次的同进程旧工作量参考/当前实现对比：
+
+```bash
+python scripts/run_performance_validation.py
+```
+
 ## 自动化测试
 
 ```bash

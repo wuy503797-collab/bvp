@@ -1,6 +1,18 @@
 CHANGELOG
 =========
 
+v2.9 (2026-08)
+- 新增 SolverCounters 与不可变快照，区分 Phi、Jacobian、IVP、底层 nfev、root/least-squares、延拓、Newton、阻尼和最终验收
+- 为 RunMetadata 增加 core/API 时间边界和性能计数，保持既有 elapsed_seconds 的公共 API 总时间语义
+- 建立指数、振子、制造解、26.1 打靶/延拓、无实根和奇异 IVP 的预热及重复中位数基准
+- 确认变分积分生成的 XT 未参与最终 Jacobian，并删除每次 Jacobian 的冗余变分 IVP
+- 在同一 Newton 参数快照内复用已计算的 Phi_current，保留原前向差分方向、步长和异常传播
+- 26.1 延拓同进程参考中 IVP 874→600、总 nfev 131732→94200，Jacobian 数组和最终数值结果不变
+- 当前机器 3 次核心中位耗时约 0.956s→0.617s；该数据仅为本机证据，不作为测试时间门槛或跨机器承诺
+- 验证每次公共 API 求解只解析、lambdify 和编译边界一次；未增加跨任务全局缓存
+- 默认日志级别关闭时在创建 solver 事件前短路，保留关键事件、结果不可变性和独立最终验收 IVP
+- 新增同进程旧工作量参考与当前实现的性能验证脚本；记录最终验收、GUI 兼容复制等暂不优化热点
+
 v2.8 (2026-08)
 - 新增 UUID run_id、稳定 SHA-256 problem_signature、不可变 RunContext 和 RunMetadata
 - 核心 API、worker、成功、数值失败、取消和编程异常统一关联运行身份与 perf_counter 耗时

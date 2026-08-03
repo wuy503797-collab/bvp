@@ -69,6 +69,9 @@ def test_success_record_has_one_machine_fact_source_and_no_raw_solution() -> Non
     text = canonical_text_summary(canonical)
 
     assert data["run"]["request_id"] == request.request_id
+    assert data["run"]["core_elapsed_seconds"] >= 0
+    assert data["run"]["api_elapsed_seconds"] >= data["run"]["core_elapsed_seconds"]
+    assert data["run"]["performance_counters"]["ivp_solves"] > 0
     assert data["result"]["success"] is True
     assert "sol" not in data["result"]
     assert "raw_solution" not in canonical_json_text(canonical)
@@ -79,6 +82,7 @@ def test_success_record_has_one_machine_fact_source_and_no_raw_solution() -> Non
         data["result"]["status"],
     ):
         assert value in text
+    assert "performance_counters:" in text
 
 
 def test_singular_ivp_failure_is_strictly_serializable() -> None:

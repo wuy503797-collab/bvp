@@ -22,6 +22,16 @@ from .results import BVPResult
 from .solver import BVPSolver
 
 
+def _solver_metadata_snapshot(
+    legacy_result: dict[str, Any] | None,
+    solver: BVPSolver | None,
+) -> dict[str, Any]:
+    metadata = dict((legacy_result or {}).get("solver_metadata", {}))
+    if solver is not None:
+        metadata.update(solver.performance_metadata())
+    return metadata
+
+
 def solve_bvp_problem(
     problem: BVPProblem,
     config: SolverConfig,
@@ -50,6 +60,7 @@ def solve_bvp_problem(
 
     started_perf = time.perf_counter()
     legacy_result: dict[str, Any] | None = None
+    solver: BVPSolver | None = None
     current_phase = "validation"
     emit_solver_event(context, "solve_requested", phase="request", status="accepted")
     try:
@@ -108,7 +119,7 @@ def solve_bvp_problem(
             boundary_count=len(problem.boundary_conditions),
             final_status="cancelled",
             elapsed_seconds=elapsed,
-            solver_metadata=(legacy_result or {}).get("solver_metadata", {}),
+            solver_metadata=_solver_metadata_snapshot(legacy_result, solver),
             result_data=legacy_result,
         )
         attach_run_metadata(exc, metadata)
@@ -179,7 +190,7 @@ def solve_bvp_problem(
                 boundary_count=len(problem.boundary_conditions),
                 final_status="internal_error",
                 elapsed_seconds=elapsed,
-                solver_metadata=(legacy_result or {}).get("solver_metadata", {}),
+                solver_metadata=_solver_metadata_snapshot(legacy_result, solver),
                 result_data=legacy_result,
             )
             attach_run_metadata(exc, metadata)
@@ -221,7 +232,7 @@ def solve_bvp_problem(
             boundary_count=len(problem.boundary_conditions),
             final_status="internal_error",
             elapsed_seconds=elapsed,
-            solver_metadata=(legacy_result or {}).get("solver_metadata", {}),
+            solver_metadata=_solver_metadata_snapshot(legacy_result, solver),
             result_data=legacy_result,
         )
         attach_run_metadata(exc, metadata)

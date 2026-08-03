@@ -9,6 +9,7 @@ from .exceptions import ExpressionValidationError, IVPIntegrationError
 from .expression_policy import ExpressionContext
 from .expressions import SymPyParser
 from .models import BVPProblem, BVPValidationError, SolverConfig
+from .performance import SolverCounters, SolverCounterSnapshot
 from .observability import (
     RunContext,
     RunMetadata,
@@ -68,6 +69,8 @@ __all__ = [
     "SolveRecord",
     "SolveRequest",
     "SolverConfig",
+    "SolverCounters",
+    "SolverCounterSnapshot",
     "SolverEvent",
     "SymPyParser",
     "gui_transition_allowed",

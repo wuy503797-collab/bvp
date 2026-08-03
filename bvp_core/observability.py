@@ -26,6 +26,11 @@ EVENT_DETAILS_STRING_LIMIT = 256
 EVENT_LOGGER = logging.getLogger("bvp_core.events")
 
 
+def solver_event_enabled(level: int) -> bool:
+    """Return whether structured event construction is observable at ``level``."""
+    return EVENT_LOGGER.isEnabledFor(level)
+
+
 def utc_now_iso() -> str:
     """Return a timezone-aware UTC timestamp with a stable ``Z`` suffix."""
     return datetime.now(timezone.utc).isoformat(timespec="microseconds").replace(
@@ -196,23 +201,38 @@ class RunMetadata:
     started_at: str
     completed_at: str
     elapsed_seconds: float
+    core_elapsed_seconds: float | None
+    api_elapsed_seconds: float
     final_status: str
     tolerance_mode: str
     effective_tolerances: Mapping[str, Any]
     python_version: str
     package_versions: Mapping[str, str]
     platform_summary: Mapping[str, str]
+    performance_counters: Mapping[str, int]
     application_version: str = APPLICATION_VERSION
     solver_diagnostics: Mapping[str, Any] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
         if self.elapsed_seconds < 0 or not np.isfinite(self.elapsed_seconds):
             raise ValueError("elapsed_seconds must be a non-negative finite number")
+        if self.api_elapsed_seconds < 0 or not np.isfinite(self.api_elapsed_seconds):
+            raise ValueError("api_elapsed_seconds must be a non-negative finite number")
+        if self.core_elapsed_seconds is not None and (
+            self.core_elapsed_seconds < 0
+            or not np.isfinite(self.core_elapsed_seconds)
+        ):
+            raise ValueError(
+                "core_elapsed_seconds must be None or a non-negative finite number"
+            )
         object.__setattr__(
             self, "effective_tolerances", _freeze(dict(self.effective_tolerances))
         )
         object.__setattr__(self, "package_versions", _freeze(dict(self.package_versions)))
         object.__setattr__(self, "platform_summary", _freeze(dict(self.platform_summary)))
+        object.__setattr__(
+            self, "performance_counters", _freeze(dict(self.performance_counters))
+        )
         object.__setattr__(
             self, "solver_diagnostics", _freeze(dict(self.solver_diagnostics))
         )
@@ -230,12 +250,15 @@ class RunMetadata:
             "started_at": self.started_at,
             "completed_at": self.completed_at,
             "elapsed_seconds": self.elapsed_seconds,
+            "core_elapsed_seconds": self.core_elapsed_seconds,
+            "api_elapsed_seconds": self.api_elapsed_seconds,
             "final_status": self.final_status,
             "tolerance_mode": self.tolerance_mode,
             "effective_tolerances": _thaw(self.effective_tolerances),
             "python_version": self.python_version,
             "package_versions": _thaw(self.package_versions),
             "platform_summary": _thaw(self.platform_summary),
+            "performance_counters": _thaw(self.performance_counters),
             "application_version": self.application_version,
             "solver_diagnostics": _thaw(self.solver_diagnostics),
         }
@@ -300,6 +323,8 @@ def _solver_diagnostics(
             "message": result.get("ivp_message"),
             "t_final": result.get("ivp_t_final"),
         },
+        "performance_counters": metadata.get("performance_counters", {}),
+        "core_elapsed_seconds": metadata.get("core_elapsed_seconds"),
     }
 
 
@@ -315,6 +340,7 @@ def build_run_metadata(
     completed_at: str | None = None,
 ) -> RunMetadata:
     tolerances = config.effective_tolerances(boundary_count).to_metadata()
+    performance = dict(solver_metadata or {})
     return RunMetadata(
         schema_version=RUN_METADATA_SCHEMA_VERSION,
         run_id=context.run_id,
@@ -327,12 +353,15 @@ def build_run_metadata(
         started_at=context.started_at,
         completed_at=completed_at or utc_now_iso(),
         elapsed_seconds=float(elapsed_seconds),
+        core_elapsed_seconds=performance.get("core_elapsed_seconds"),
+        api_elapsed_seconds=float(elapsed_seconds),
         final_status=str(final_status),
         tolerance_mode=str(tolerances["tolerance_mode"]),
         effective_tolerances=tolerances,
         python_version=platform.python_version(),
         package_versions=_package_versions(),
         platform_summary={"system": platform.system(), "machine": platform.machine()},
+        performance_counters=performance.get("performance_counters", {}),
         solver_diagnostics=sanitize_diagnostic_value(
             _solver_diagnostics(solver_metadata, result_data)
         ),

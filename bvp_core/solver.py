@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import time
 from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Any, Optional
@@ -15,7 +16,8 @@ from scipy.optimize import root
 from .exceptions import IVPIntegrationError
 from .expressions import SymPyParser
 from .models import BVPProblem, SolverConfig
-from .observability import RunContext, emit_solver_event
+from .observability import RunContext, emit_solver_event, solver_event_enabled
+from .performance import SolverCounters
 from .requests import SolveCancelled
 from .tolerances import ResolvedTolerances, evaluate_boundary_acceptance
 
@@ -105,6 +107,9 @@ class BVPSolver:
         self.ds = _SolverInputs.from_models(problem, config)
         self.tolerances = self.ds.tolerances
         self.run_context = run_context or RunContext.create(problem, config)
+        self.counters = SolverCounters()
+        self.core_elapsed_seconds: float | None = None
+        self._local_phi_base: tuple[np.ndarray, np.ndarray] | None = None
         self.parser = parser or SymPyParser(list(problem.odes), list(problem.var_names))
         self.bc_residual = SymPyParser.parse_boundary_conditions(
             list(problem.boundary_conditions), list(problem.var_names)
@@ -116,6 +121,32 @@ class BVPSolver:
         if self._cancellation_check is not None:
             self._cancellation_check()
 
+    def performance_metadata(self) -> dict[str, Any]:
+        """Return a plain snapshot suitable for result and exception metadata."""
+        return {
+            "performance_counters": self.counters.snapshot().to_dict(),
+            "core_elapsed_seconds": self.core_elapsed_seconds,
+        }
+
+    def _set_local_phi_base(self, p: np.ndarray, residual: np.ndarray) -> None:
+        """Stage one parameter-bound residual for the immediately next Jacobian."""
+        self._local_phi_base = (
+            np.asarray(p, dtype=float).copy(),
+            np.asarray(residual, dtype=float).copy(),
+        )
+
+    def _take_local_phi_base(self, p: np.ndarray) -> np.ndarray | None:
+        staged = self._local_phi_base
+        self._local_phi_base = None
+        if staged is None:
+            return None
+        parameters, residual = staged
+        if not np.array_equal(parameters, np.asarray(p, dtype=float)):
+            raise ValueError(
+                "local Phi base may only be reused for the identical parameter vector"
+            )
+        return residual
+
     def _emit(
         self,
         event_name: str,
@@ -125,6 +156,8 @@ class BVPSolver:
         details: dict[str, Any] | None = None,
         level: int = logging.INFO,
     ) -> None:
+        if not solver_event_enabled(level):
+            return
         emit_solver_event(
             self.run_context,
             event_name,
@@ -159,10 +192,17 @@ class BVPSolver:
         """Извлекает параметры p из полного состояния."""
         return state[self.unknown]
 
-    def _solve_ivp(self, p: np.ndarray, t_span: List[float],
-                   dense_output: bool = False) -> Any:
+    def _solve_ivp(
+        self,
+        p: np.ndarray,
+        t_span: List[float],
+        dense_output: bool = False,
+        *,
+        purpose: str = "solver",
+    ) -> Any:
         """Solve the inner IVP and preserve diagnostics for every failure."""
         self._check_cancelled()
+        self.counters.record_ivp_start(purpose=purpose)
         self._emit(
             "ivp_started",
             phase="ivp",
@@ -190,6 +230,7 @@ class BVPSolver:
             raise IVPIntegrationError(
                 f"solve_ivp raised {type(exc).__name__}: {exc}", p=p
             ) from exc
+        self.counters.record_ivp_result(sol, purpose=purpose)
 
         self._check_cancelled()
 
@@ -337,6 +378,7 @@ class BVPSolver:
         # Effective values are authoritative and cannot be shadowed by
         # algorithm-specific metadata assembled along the solve path.
         metadata.update(self.tolerances.to_metadata())
+        metadata.update(self.performance_metadata())
         metadata.update(
             {
                 "run_id": self.run_context.run_id,
@@ -446,7 +488,10 @@ class BVPSolver:
         self._check_cancelled()
         try:
             sol = self._solve_ivp(
-                p, [self.ds.t_star, self.ds.T], dense_output=True
+                p,
+                [self.ds.t_star, self.ds.T],
+                dense_output=True,
+                purpose="final_validation",
             )
         except IVPIntegrationError as exc:
             return self._build_ivp_failure_result(
@@ -503,7 +548,10 @@ class BVPSolver:
         интегрирования остаётся [0, 1] (ds.T = 1.0).
         """
         self._check_cancelled()
-        sol = self._solve_ivp(p, [self.ds.t_star, self.ds.T])
+        self.counters.phi_evaluations += 1
+        sol = self._solve_ivp(
+            p, [self.ds.t_star, self.ds.T], purpose="phi"
+        )
         self._check_cancelled()
         x0_full = self._p_to_state(p)
         xT_full = sol.y[:, -1]
@@ -512,114 +560,32 @@ class BVPSolver:
         return residual
 
     def _dPhi_dp(self, p: np.ndarray) -> np.ndarray:
-        """
-        Вычисляет матрицу Φ'(p).
+        """Evaluate the existing forward-difference Jacobian.
 
-        Стратегия:
-          1. Пробуем совместное интегрирование + вариационное уравнение.
-          2. При неудаче — чистое численное дифференцирование (надёжный fallback).
+        A solver-private, single-use base residual may be staged with its exact
+        parameter snapshot. This keeps reuse local to one Newton iteration and
+        prevents a residual from a previous parameter vector being cached by error.
+        The perturbation direction and step are unchanged from the former primary
+        path; only the unused variational IVP has been removed.
         """
         self._check_cancelled()
+        parameters = np.asarray(p, dtype=float)
+        base = self._take_local_phi_base(parameters)
+        if base is None:
+            base = self._Phi(parameters)
+
+        self.counters.jacobian_evaluations += 1
         k = len(self.unknown)
-        # Определяем размерность Φ(p) реальным вызовом
-        Phi_base = self._Phi(p)
-        m = len(Phi_base)
-        n = self.ds.dim()
-        T = self.ds.T
-
-        # --- Попытка 1: совместное интегрирование состояния + вариаций ---
-        try:
-            x0 = self._p_to_state(p)
-            X0 = np.eye(n)
-            y0 = np.concatenate([x0, X0.flatten()])
-
-            def combined_ode(t, y):
-                x = y[:n]
-                Xmat = y[n:].reshape(n, n)
-                try:
-                    J = self.parser.jac(t, x)
-                except Exception:
-                    # Fallback: численный якобиан если аналитический не доступен
-                    J = self._numerical_jac_f(t, x)
-                dxdt = self.parser.f(t, x)
-                dXdt = J @ Xmat
-                return np.concatenate([dxdt, dXdt.flatten()])
-
-            sol = solve_ivp(
-                combined_ode, [self.ds.t_star, T], y0,
-                method="RK45",
-                rtol=self.tolerances.jacobian_ivp_rtol,
-                atol=self.tolerances.jacobian_ivp_atol,
-                dense_output=False,
-            )
-            self._check_cancelled()
-            if sol.success:
-                yT = sol.y[:, -1]
-                XT = yT[n:].reshape(n, n)
-                # dΦ/dp через вариации + численное дифференцирование BC
-                eps_jac = max(1e-7, self.tolerances.jacobian_relative_step)
-                jac_matrix = np.zeros((m, k))
-                for j in range(k):
-                    p_perturb = p.copy()
-                    p_perturb[j] += eps_jac
-                    Phi_perturb = self._Phi(p_perturb)
-                    jac_matrix[:, j] = (Phi_perturb - Phi_base) / eps_jac
-                return jac_matrix
-        except SolveCancelled:
-            raise
-        except IVPIntegrationError:
-            raise
-        except Exception:
-            return self._dPhi_dp_numerical(p, Phi_base)
-
-        # --- Попытка 2 (fallback): чистое численное дифференцирование ---
-        return self._dPhi_dp_numerical(p, Phi_base)
-
-    def _dPhi_dp_numerical(self, p: np.ndarray,
-                           Phi_base: Optional[np.ndarray] = None) -> np.ndarray:
-        """
-        Надёжный fallback: dΦ/dp численным дифференцированием.
-        Используется когда вариационное уравнение не сходится.
-        """
-        k = len(self.unknown)
-        if Phi_base is None:
-            Phi_base = self._Phi(p)
-        m = len(Phi_base)
-
-        # Адаптивный шаг
-        eps_jac = max(
-            1e-7, min(1e-4, self.tolerances.jacobian_relative_step)
-        )
+        m = len(base)
+        eps_jac = max(1e-7, self.tolerances.jacobian_relative_step)
         jac_matrix = np.zeros((m, k))
         for j in range(k):
             self._check_cancelled()
-            p_perturb = p.copy()
-            h = eps_jac * max(1.0, abs(p[j]))
-            p_perturb[j] += h
-            try:
-                Phi_perturb = self._Phi(p_perturb)
-                jac_matrix[:, j] = (Phi_perturb - Phi_base) / h
-            except SolveCancelled:
-                raise
-            except Exception:
-                # Односторонняя разность
-                p_perturb2 = p.copy()
-                p_perturb2[j] -= h
-                Phi_perturb2 = self._Phi(p_perturb2)
-                jac_matrix[:, j] = (Phi_base - Phi_perturb2) / h
+            p_perturb = parameters.copy()
+            p_perturb[j] += eps_jac
+            phi_perturb = self._Phi(p_perturb)
+            jac_matrix[:, j] = (phi_perturb - base) / eps_jac
         return jac_matrix
-
-    def _numerical_jac_f(self, t: float, x: np.ndarray, h: float = 1e-8) -> np.ndarray:
-        """Численный якобиан ∂f/∂x (fallback если аналитический не доступен)."""
-        n = len(x)
-        J = np.zeros((n, n))
-        f0 = self.parser.f(t, x)
-        for j in range(n):
-            x_perturb = x.copy()
-            x_perturb[j] += h
-            f_perturb = self.parser.f(t, x_perturb)
-            J[:, j] = (f_perturb - f0) / h
-        return J
 
     # ------------------------------------------------------------------
     # 3.1 Метод стрельбы (shooting)
@@ -638,7 +604,12 @@ class BVPSolver:
         self._check_cancelled()
         p0 = np.array(self.ds.guess, dtype=float)
 
-        def residual(p):
+        def root_residual(p):
+            self.counters.root_residual_calls += 1
+            return self._Phi(p)
+
+        def least_squares_residual(p):
+            self.counters.least_squares_residual_calls += 1
             return self._Phi(p)
 
         if callback:
@@ -657,7 +628,7 @@ class BVPSolver:
         # но окончательное решение всё равно независимо перевычисляется ниже.
         try:
             root_result = root(
-                residual,
+                root_residual,
                 p0,
                 method="hybr",
                 tol=self.tolerances.root_tol,
@@ -734,7 +705,7 @@ class BVPSolver:
                 callback("shooting", 0, "hybr не сошёлся, пробуем least_squares...")
             try:
                 ls_result = least_squares(
-                    residual,
+                    least_squares_residual,
                     p0,
                     ftol=self.tolerances.least_squares_ftol,
                     xtol=self.tolerances.least_squares_xtol,
@@ -909,6 +880,7 @@ class BVPSolver:
 
         for step in range(1, N + 1):
             self._check_cancelled()
+            self.counters.continuation_steps_attempted += 1
             mu = step / N
             target = (1.0 - mu) * Phi_p0
             step_metadata: Dict[str, Any] = {
@@ -924,6 +896,7 @@ class BVPSolver:
 
             for _newton_iter in range(20):
                 self._check_cancelled()
+                self.counters.newton_iterations += 1
                 try:
                     Phi_current = self._Phi(p)
                 except SolveCancelled:
@@ -957,7 +930,11 @@ class BVPSolver:
                     break
 
                 try:
-                    dPhi = self._dPhi_dp(p)
+                    self._set_local_phi_base(p, Phi_current)
+                    try:
+                        dPhi = self._dPhi_dp(p)
+                    finally:
+                        self._local_phi_base = None
                     step_metadata["jacobian_success"] = bool(
                         np.isfinite(dPhi).all()
                         and dPhi.shape == (len(residual), len(p))
@@ -1001,6 +978,7 @@ class BVPSolver:
                 accepted_update = False
                 for factor in (1.0, 0.5, 0.25, 0.125, 0.0625):
                     self._check_cancelled()
+                    self.counters.damping_trials += 1
                     p_try = p - factor * delta
                     if not np.isfinite(p_try).all():
                         continue
@@ -1032,6 +1010,7 @@ class BVPSolver:
                         step_metadata["damping_success"] = True
                         step_metadata["newton_updates"] += 1
                         total_newton += 1
+                        self.counters.newton_updates += 1
                         break
 
                 if not accepted_update:
@@ -1083,6 +1062,7 @@ class BVPSolver:
                 break
 
             solver_metadata["steps"].append(step_metadata)
+            self.counters.continuation_steps_completed += 1
             self._emit(
                 "continuation_step_completed",
                 phase="continuation",
@@ -1133,12 +1113,21 @@ class BVPSolver:
 
     def solve(self, callback: Optional[Callable] = None) -> dict:
         """Dispatch to the method selected by the immutable core configuration."""
-        self._check_cancelled()
-        errors = self.ds.validate()
-        if errors:
-            raise ValueError("; ".join(errors))
+        started = time.perf_counter()
+        result: dict | None = None
+        try:
+            self._check_cancelled()
+            errors = self.ds.validate()
+            if errors:
+                raise ValueError("; ".join(errors))
 
-        if self.ds.solver_method == "shooting":
-            return self.solve_shooting(callback)
-        else:
-            return self.solve_continuation(callback)
+            if self.ds.solver_method == "shooting":
+                result = self.solve_shooting(callback)
+            else:
+                result = self.solve_continuation(callback)
+            return result
+        finally:
+            self.core_elapsed_seconds = time.perf_counter() - started
+            if result is not None:
+                metadata = result.setdefault("solver_metadata", {})
+                metadata.update(self.performance_metadata())
