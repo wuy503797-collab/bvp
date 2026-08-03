@@ -8,6 +8,8 @@ from typing import Any, Mapping
 
 import numpy as np
 
+from .observability import RunMetadata
+
 
 def _readonly_vector(value: Any) -> np.ndarray:
     array = np.array([] if value is None else value, dtype=float, copy=True).reshape(-1)
@@ -108,6 +110,7 @@ class BVPResult:
     boundary_max_scaled_ratio: float | None = None
     iterations: int = 0
     solver_metadata: Mapping[str, Any] = field(default_factory=dict)
+    run_metadata: RunMetadata | None = None
     boundary_acceptance: str = (
         "abs(residual_i) <= boundary_atol + boundary_rtol * boundary_scales_i"
     )
@@ -161,6 +164,10 @@ class BVPResult:
         object.__setattr__(
             self, "solver_metadata", _freeze_metadata(self.solver_metadata)
         )
+        if self.run_metadata is not None and not isinstance(
+            self.run_metadata, RunMetadata
+        ):
+            raise TypeError("run_metadata must be a RunMetadata instance or None")
 
     @property
     def sol(self) -> Any | None:
@@ -203,11 +210,19 @@ class BVPResult:
             "boundary_acceptance": self.boundary_acceptance,
             "iterations": self.iterations,
             "solver_metadata": _thaw_metadata(self.solver_metadata),
+            "run_metadata": (
+                None if self.run_metadata is None else self.run_metadata.to_dict()
+            ),
             "residual_norm": self.boundary_residual_norm,
         }
 
     @classmethod
-    def from_legacy_dict(cls, data: Mapping[str, Any]) -> "BVPResult":
+    def from_legacy_dict(
+        cls,
+        data: Mapping[str, Any],
+        *,
+        run_metadata: RunMetadata | None = None,
+    ) -> "BVPResult":
         """Convert the current BVPSolver mapping into the stable result model."""
         success = bool(data.get("success", False))
         boundary_norm = float(
@@ -243,6 +258,7 @@ class BVPResult:
             boundary_max_scaled_ratio=data.get("boundary_max_scaled_ratio"),
             iterations=int(data.get("iterations", 0)),
             solver_metadata=data.get("solver_metadata", {}),
+            run_metadata=run_metadata,
             boundary_acceptance=str(
                 data.get(
                     "boundary_acceptance",

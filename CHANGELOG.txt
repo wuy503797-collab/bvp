@@ -1,6 +1,18 @@
 CHANGELOG
 =========
 
+v2.8 (2026-08)
+- 新增 UUID run_id、稳定 SHA-256 problem_signature、不可变 RunContext 和 RunMetadata
+- 核心 API、worker、成功、数值失败、取消和编程异常统一关联运行身份与 perf_counter 耗时
+- 新增标准库 logging 结构化事件，核心仅安装 NullHandler，不配置全局 handler 或控制台输出
+- 规范 root、least_squares、延拓和 IVP 的真实可用诊断，并补充 least_squares njev
+- 新增 bvp-result-v1 CanonicalExportRecord，JSON 与 TXT 共享问题、配置、结果和诊断事实源
+- JSON 使用严格 UTF-8/allow_nan=False；非有限失败诊断使用显式标记，排除原始 SciPy 对象
+- JSON、TXT 和任务库保存统一采用同目录临时文件、fsync 与 os.replace 原子替换
+- GUI 显示 run/request 关联、状态、容差模式、边界比值和耗时，并记录过期/重复信号与导出事件
+- 增加日志截断、路径和 opaque 对象脱敏，以及导出环境信息最小化隐私边界
+- 新增成功、失败、奇异 IVP、取消、Unicode、原子失败和统一导出终端验收
+
 v2.7 (2026-08)
 - 将 IVP、root、least_squares、延拓 Newton、参数 Jacobian 和最终边界验收容差拆分为显式语义
 - 保留旧 eps 与旧 JSON，并在唯一解析入口按原映射补全未显式提供的过程容差

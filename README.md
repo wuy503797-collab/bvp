@@ -213,6 +213,73 @@ boundary_success = all(component_success_i)
 python scripts/run_tolerance_validation.py
 ```
 
+## 运行可观测性与统一导出
+
+每次真正执行求解都会创建一个新的 UUID `run_id`，即使数学问题和配置完全相同也不会
+复用。GUI 的 `request_id` 标识一次不可变用户请求；它与 `run_id` 不同，未来同一请求若
+重试，可以关联新的运行。`problem_signature` 是规范化问题定义 JSON 的 SHA-256，跨
+进程稳定，不使用 Python `hash()`，也不包含路径、时间或 Qt 对象。
+
+公共 API 调用方式保持不变：
+
+```python
+result = solve_bvp_problem(problem, config)
+print(result.run_metadata.run_id)
+print(result.run_metadata.elapsed_seconds)
+```
+
+`RunMetadata` 在成功和数值失败结果中均为不可变对象，记录 UTC 开始/结束时间、由
+`time.perf_counter()` 测得的耗时、最终状态、实际求解方法、有效容差、Python 与
+NumPy/SciPy/SymPy 版本，以及真实可取得的 IVP、root、least-squares 和延拓诊断。
+取消和没有 `BVPResult` 的编程异常通过 `SolveOutcome.run_metadata` 保留同样的运行关联。
+一次机器上的单次耗时只是诊断事实，不是性能承诺或基准结果。
+
+核心包使用标准库 `logging` 的 `bvp_core.events` logger，并仅安装 `NullHandler`：导入或
+调用 `bvp_core` 不会调用 `logging.basicConfig()`、创建日志文件或主动输出到
+stdout/stderr。应用可以显式安装自己的 handler；每条记录的 `solver_event` 属性包含
+结构化事件字典：
+
+```python
+import logging
+
+handler = logging.StreamHandler()
+logging.getLogger("bvp_core.events").addHandler(handler)
+logging.getLogger("bvp_core.events").setLevel(logging.INFO)
+```
+
+INFO 记录一次求解的关键阶段，WARNING 记录可恢复异常、辅助输出失败和过期/重复 GUI
+信号，ERROR 只用于导出或内部编程错误；逐延拓步骤属于 DEBUG，不会在默认 INFO 刷屏。
+事件细节会截断长字符串，并脱敏 Path、opaque 对象和已知本机路径；默认日志不包含环境
+变量、用户目录、完整解释器路径、Qt repr、原始 SciPy 对象或完整恶意表达式。完整技术
+traceback 只保留在 worker 内部诊断和 DEBUG 技术日志中，普通 GUI 只显示简化消息。
+
+结果导出统一先构造不可变 `CanonicalExportRecord`，其 schema 为独立于应用版本的：
+
+```text
+bvp-result-v1
+```
+
+记录包含产生结果的 `SolveRequest` 问题与配置快照、显式和有效容差、运行元数据、结果、
+IVP/优化器/算法/边界诊断、来源信息及辅助输出。导出历史结果不会重新读取当前 GUI
+编辑器，因此任务被编辑或删除后，原结果的数学内容仍保持不变。完整问题表达式属于用户
+主动定义的快照，可以进入导出；这不同于错误日志中受限的表达式预览。
+
+JSON 是机器可读事实来源，使用 UTF-8、`ensure_ascii=False`、`allow_nan=False` 和稳定
+字段顺序；非有限失败诊断显式写为 `{"non_finite": ...}`，不会输出非标准 NaN/Infinity
+或伪装成 0。TXT 从同一个规范记录生成，是包含 schema、运行关联、配置、有效容差、
+关键诊断、数值表和辅助输出的人类可读摘要，不承诺可无损重新导入或执行。
+
+JSON、TXT 以及 GUI 任务库保存均采用同目标目录临时文件、flush、fsync 和 `os.replace`
+原子替换；写入或序列化失败时已有目标文件保持不变，临时文件会尽可能清理。GUI 仍只
+导出成功历史；失败和取消可通过核心规范记录 API 生成明确的
+`failure_diagnostic`/`cancelled` 诊断，绝不会伪装为成功结果。
+
+可单独运行第九阶段的结构化事件、运行关联、统一导出、原子写入和隐私边界验收：
+
+```bash
+python scripts/run_observability_validation.py
+```
+
 ## 自动化测试
 
 ```bash

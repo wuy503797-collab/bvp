@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import os
 from threading import Event
 from types import SimpleNamespace
@@ -19,6 +20,7 @@ from bvp_core import (
     BVPResult,
     CancellationToken,
     GuiSolveState,
+    RunContext,
     SolveOutcome,
     SolveOutcomeStatus,
     SolveRecord,
@@ -538,6 +540,8 @@ def test_precancelled_worker_emits_cancelled_with_request_id() -> None:
 
     assert captured[0][0] == request.request_id
     assert captured[0][1].status is SolveOutcomeStatus.CANCELLED
+    assert captured[0][1].run_id == worker.run_context.run_id
+    assert captured[0][1].run_metadata.final_status == "cancelled"
 
 
 def test_worker_success_signal_returns_structured_outcome_with_request_id() -> None:
@@ -553,6 +557,26 @@ def test_worker_success_signal_returns_structured_outcome_with_request_id() -> N
     assert captured[0][0] == request.request_id
     assert captured[0][1].status is SolveOutcomeStatus.COMPLETED
     assert captured[0][1].result.success is True
+    assert captured[0][1].run_id == worker.run_context.run_id
+    assert captured[0][1].run_metadata.request_id == request.request_id
+
+
+def test_gui_success_detail_displays_run_request_status_and_elapsed(window) -> None:
+    request = _request("display-run")
+    worker = SolverWorker(request)
+    captured = []
+    worker.request_finished.connect(lambda _request_id, outcome: captured.append(outcome))
+    worker.run()
+    _activate(window, request)
+    window._run_contexts[request.request_id] = worker.run_context
+
+    window._on_solve_done(request.request_id, captured[0])
+
+    detail = window.progress_detail.text()
+    assert worker.run_context.run_id[:8] in detail
+    assert request.request_id[:8] in detail
+    assert "status=success" in detail
+    assert "elapsed_seconds=" in detail
 
 
 def test_worker_programming_failure_retains_traceback() -> None:
@@ -579,6 +603,11 @@ def test_worker_programming_failure_retains_traceback() -> None:
     assert captured[0][0] == request.request_id
     assert captured[0][1].result is None
     assert "Traceback" in captured[0][1].technical_diagnostic
+    assert captured[0][1].run_id == worker.run_context.run_id
+    assert captured[0][1].run_metadata.final_status in {
+        "expression_validation_failed",
+        "internal_error",
+    }
 
 
 def test_invalid_auxiliary_expression_keeps_primary_result(window) -> None:
@@ -602,6 +631,31 @@ def test_dangerous_auxiliary_expression_is_isolated_after_primary_solve(window) 
     assert "forbidden_name" in record.auxiliary_errors[0]
 
 
+def test_auxiliary_failure_emits_structured_warning(window, caplog) -> None:
+    caplog.set_level(logging.WARNING, logger="bvp_core.events")
+    request = _request("aux-event", auxiliary='__import__("os")')
+    window._run_contexts[request.request_id] = RunContext.create(
+        request.problem,
+        request.config,
+        request_id=request.request_id,
+        source_task_id=request.source_task_id,
+    )
+
+    _complete(window, request)
+
+    events = [
+        record.solver_event
+        for record in caplog.records
+        if hasattr(record, "solver_event")
+    ]
+    auxiliary = [
+        event for event in events if event["event_name"] == "auxiliary_output_failed"
+    ]
+    assert auxiliary
+    assert auxiliary[-1]["run_id"] == window._run_contexts[request.request_id].run_id
+    assert len(auxiliary[-1]["details"]["reason"]) <= 256
+
+
 def test_json_export_contains_effective_tolerances_and_boundary_thresholds(
     window, monkeypatch, tmp_path
 ) -> None:
@@ -615,10 +669,118 @@ def test_json_export_contains_effective_tolerances_and_boundary_thresholds(
     window.on_export()
 
     exported = json.loads(export_path.read_text(encoding="utf-8"))
-    assert exported["tolerances"]["tolerance_mode"] == "legacy"
-    assert exported["tolerances"]["effective_ivp_rtol"] == 1e-8
-    assert exported["boundary_acceptance"]["thresholds"] == [1e-8]
-    assert exported["boundary_acceptance"]["max_scaled_ratio"] == 0.0
+    assert exported["schema_version"] == "bvp-result-v1"
+    assert exported["effective_tolerances"]["tolerance_mode"] == "legacy"
+    assert exported["effective_tolerances"]["effective_ivp_rtol"] == 1e-8
+    boundary = exported["diagnostics"]["boundary_acceptance"]
+    assert boundary["thresholds"] == [1e-8]
+    assert boundary["max_scaled_ratio"] == 0.0
+    assert exported["problem"]["name"] == record.request.task_name
+
+
+def test_json_export_uses_record_snapshot_and_is_byte_repeatable(
+    window, monkeypatch, tmp_path
+) -> None:
+    record = _complete(window, _request("Original snapshot"))
+    first = tmp_path / "first.json"
+    second = tmp_path / "second.json"
+    paths = iter((str(first), str(second)))
+    monkeypatch.setattr(
+        "main.QFileDialog.getSaveFileName",
+        lambda *_args, **_kwargs: (next(paths), "JSON (*.json)"),
+    )
+    window.tasks = [_dataset("Edited current task")]
+
+    window.on_export()
+    window.on_export()
+
+    assert first.read_bytes() == second.read_bytes()
+    exported = json.loads(first.read_text(encoding="utf-8"))
+    assert exported["problem"]["name"] == "Original snapshot"
+    assert exported["provenance"]["request_id"] == record.request_id
+
+
+def test_text_export_uses_same_schema_and_key_diagnostics(
+    window, monkeypatch, tmp_path
+) -> None:
+    record = _complete(window, _request("Text snapshot"))
+    export_path = tmp_path / "result.txt"
+    monkeypatch.setattr(
+        "main.QFileDialog.getSaveFileName",
+        lambda *_args, **_kwargs: (str(export_path), "Text (*.txt)"),
+    )
+
+    window.on_export()
+
+    text = export_path.read_text(encoding="utf-8")
+    assert "schema_version: bvp-result-v1" in text
+    assert f"request_id: {record.request_id}" in text
+    assert "name: Text snapshot" in text
+    assert "effective_tolerances:" in text
+    assert "boundary_thresholds:" in text
+
+
+def test_stale_and_duplicate_signals_emit_structured_events(
+    window, caplog
+) -> None:
+    caplog.set_level(logging.WARNING, logger="bvp_core.events")
+    old_request = _request("event-old")
+    active_request = _request("event-active")
+    _activate(window, active_request)
+    window._run_contexts[old_request.request_id] = RunContext.create(
+        old_request.problem,
+        old_request.config,
+        request_id=old_request.request_id,
+        source_task_id=old_request.source_task_id,
+    )
+    outcome = SolveOutcome(
+        request=old_request,
+        status=SolveOutcomeStatus.COMPLETED,
+        result=_successful_result(),
+    )
+
+    window._on_solve_done(old_request.request_id, outcome)
+    window._on_solve_done(old_request.request_id, outcome)
+
+    names = {
+        record.solver_event["event_name"]
+        for record in caplog.records
+        if hasattr(record, "solver_event")
+    }
+    assert "stale_signal_ignored" in names
+    assert "duplicate_signal_ignored" in names
+
+
+def test_export_emits_structured_start_and_success_without_path(
+    window, monkeypatch, tmp_path, caplog
+) -> None:
+    caplog.set_level(logging.INFO, logger="bvp_core.events")
+    record = _complete(window, _request("export-events"))
+    context = RunContext.create(
+        record.request.problem,
+        record.request.config,
+        request_id=record.request_id,
+        source_task_id=record.request.source_task_id,
+    )
+    window._run_contexts[record.request_id] = context
+    export_path = tmp_path / "result.json"
+    monkeypatch.setattr(
+        "main.QFileDialog.getSaveFileName",
+        lambda *_args, **_kwargs: (str(export_path), "JSON (*.json)"),
+    )
+
+    window.on_export()
+
+    events = [
+        record.solver_event
+        for record in caplog.records
+        if hasattr(record, "solver_event") and record.run_id == context.run_id
+    ]
+    assert [event["event_name"] for event in events] == [
+        "export_started",
+        "export_succeeded",
+    ]
+    assert str(export_path) not in json.dumps(events)
 
 
 def test_close_event_cooperatively_cancels_and_joins_worker(window) -> None:

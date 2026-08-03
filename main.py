@@ -28,6 +28,7 @@ import sys
 import json
 import logging
 import re
+import time
 import traceback
 import warnings
 from dataclasses import dataclass, field, asdict
@@ -59,7 +60,13 @@ from PyQt5.QtWidgets import (
 from PyQt5.QtCore import Qt, QThread, pyqtSignal, QSize
 from PyQt5.QtGui import QFont, QKeySequence, QColor
 
-from bvp_core import solve_bvp_problem
+from bvp_core import (
+    RunContext,
+    build_canonical_export_record,
+    emit_solver_event,
+    export_canonical_record,
+    solve_bvp_problem,
+)
 from bvp_core.adapters import (
     config_from_dataset,
     problem_from_dataset,
@@ -79,6 +86,8 @@ from bvp_core.requests import (
     partition_plot_records,
 )
 from bvp_core.results import BVPResult
+from bvp_core.observability import build_run_metadata, metadata_context
+from bvp_core.serialization import write_json_data_atomic
 
 
 LOGGER = logging.getLogger(__name__)
@@ -286,12 +295,25 @@ class SolverWorker(QThread):
         super().__init__()
         self.request = request
         self.cancellation_token = cancellation_token or CancellationToken()
+        self.run_context = RunContext.create(
+            request.problem,
+            request.config,
+            request_id=request.request_id,
+            source_task_id=request.source_task_id,
+        )
 
     def request_cancel(self) -> None:
         self.cancellation_token.cancel()
+        emit_solver_event(
+            self.run_context,
+            "cancel_requested",
+            phase="cancellation",
+            status="requested",
+        )
 
     def run(self):
         request_id = self.request.request_id
+        started_perf = time.perf_counter()
         self.request_started.emit(request_id)
         try:
             self.cancellation_token.raise_if_cancelled()
@@ -301,6 +323,7 @@ class SolverWorker(QThread):
                 self.request.config,
                 cancellation_check=self.cancellation_token.raise_if_cancelled,
                 callback=self._on_progress,
+                run_context=self.run_context,
             )
             self.cancellation_token.raise_if_cancelled()
             if result.success:
@@ -320,20 +343,48 @@ class SolverWorker(QThread):
                 )
                 self.request_failed.emit(request_id, outcome)
         except SolveCancelled as exc:
+            run_metadata = exc.run_metadata or build_run_metadata(
+                self.run_context,
+                self.request.config,
+                boundary_count=len(self.request.problem.boundary_conditions),
+                final_status="cancelled",
+                elapsed_seconds=time.perf_counter() - started_perf,
+            )
+            if exc.run_metadata is None:
+                emit_solver_event(
+                    self.run_context,
+                    "solve_cancelled",
+                    phase="solve",
+                    status="cancelled",
+                    details={"elapsed_seconds": run_metadata.elapsed_seconds},
+                )
             outcome = SolveOutcome(
                 request=self.request,
                 status=SolveOutcomeStatus.CANCELLED,
                 message=str(exc),
+                run_metadata=run_metadata,
             )
             self.request_cancelled.emit(request_id, outcome)
         except Exception as exc:
             technical_diagnostic = traceback.format_exc()
-            LOGGER.exception("Solve request %s failed", request_id)
+            run_metadata = getattr(exc, "run_metadata", None) or build_run_metadata(
+                self.run_context,
+                self.request.config,
+                boundary_count=len(self.request.problem.boundary_conditions),
+                final_status="internal_error",
+                elapsed_seconds=time.perf_counter() - started_perf,
+            )
+            LOGGER.debug(
+                "Technical traceback for run %s",
+                self.run_context.run_id,
+                exc_info=True,
+            )
             outcome = SolveOutcome(
                 request=self.request,
                 status=SolveOutcomeStatus.FAILED,
                 message=f"{type(exc).__name__}: {exc}",
                 technical_diagnostic=technical_diagnostic,
+                run_metadata=run_metadata,
             )
             self.request_failed.emit(request_id, outcome)
 
@@ -1190,6 +1241,7 @@ class BvpSolverApp(QMainWindow):
         self.active_worker: Optional[SolverWorker] = None
         self.active_cancellation_token: Optional[CancellationToken] = None
         self._processed_request_ids: set[str] = set()
+        self._run_contexts: Dict[str, RunContext] = {}
         self._last_signal_diagnostic = ""
         self._closing = False
         self.close_wait_timeout_ms = 2000
@@ -1500,8 +1552,7 @@ class BvpSolverApp(QMainWindow):
             return
         try:
             data = [ds.to_dict() for ds in self.tasks]
-            with open(path, "w", encoding="utf-8") as f:
-                json.dump(data, f, indent=2, ensure_ascii=False)
+            write_json_data_atomic(path, data)
             self.progress_detail.setText(f"已保存 {len(data)} 个任务")
         except Exception as e:
             QMessageBox.critical(self, "Ошибка сохранения", str(e))
@@ -1969,6 +2020,9 @@ class BvpSolverApp(QMainWindow):
         self.active_request_id = request.request_id
         self.active_cancellation_token = token
         self.active_worker = worker
+        context = getattr(worker, "run_context", None)
+        if isinstance(context, RunContext):
+            self._run_contexts[request.request_id] = context
         self._set_gui_state(
             GuiSolveState.RUNNING,
             f"request_id={request.request_id} task={request.task_name}",
@@ -1985,7 +2039,20 @@ class BvpSolverApp(QMainWindow):
         ):
             return False
         request_id = self.active_request_id
-        self.active_cancellation_token.cancel()
+        if self.active_worker is not None and hasattr(
+            self.active_worker, "request_cancel"
+        ):
+            self.active_worker.request_cancel()
+        else:
+            self.active_cancellation_token.cancel()
+            context = self._run_contexts.get(request_id)
+            if context is not None:
+                emit_solver_event(
+                    context,
+                    "cancel_requested",
+                    phase="cancellation",
+                    status="requested",
+                )
         self._set_gui_state(
             GuiSolveState.CANCEL_REQUESTED,
             f"Cancellation requested for {request_id}; waiting for a checkpoint.",
@@ -2000,6 +2067,16 @@ class BvpSolverApp(QMainWindow):
         self, request_id: str, method: str, percent: int, message: str
     ) -> None:
         if request_id != self.active_request_id or self._closing:
+            context = self._run_contexts.get(request_id)
+            if context is not None:
+                emit_solver_event(
+                    context,
+                    "stale_signal_ignored",
+                    phase="gui",
+                    status="ignored",
+                    details={"signal": "progress"},
+                    level=logging.WARNING,
+                )
             LOGGER.info("Ignored stale progress signal for request %s", request_id)
             return
         self.progress_bar_label.setText(f"[{percent}%] {method}")
@@ -2011,6 +2088,16 @@ class BvpSolverApp(QMainWindow):
                 f"Ignored duplicate terminal signal for request {request_id}."
             )
             LOGGER.warning(self._last_signal_diagnostic)
+            context = self._run_contexts.get(request_id)
+            if context is not None:
+                emit_solver_event(
+                    context,
+                    "duplicate_signal_ignored",
+                    phase="gui",
+                    status="ignored",
+                    details={"signal": "terminal"},
+                    level=logging.WARNING,
+                )
             return False
         if request_id != self.active_request_id:
             self._processed_request_ids.add(request_id)
@@ -2019,6 +2106,16 @@ class BvpSolverApp(QMainWindow):
                 f"active_request_id={self.active_request_id}."
             )
             LOGGER.warning(self._last_signal_diagnostic)
+            context = self._run_contexts.get(request_id)
+            if context is not None:
+                emit_solver_event(
+                    context,
+                    "stale_signal_ignored",
+                    phase="gui",
+                    status="ignored",
+                    details={"signal": "terminal"},
+                    level=logging.WARNING,
+                )
             return False
         self._processed_request_ids.add(request_id)
         return True
@@ -2048,11 +2145,35 @@ class BvpSolverApp(QMainWindow):
             self.active_cancellation_token is not None
             and self.active_cancellation_token.is_cancelled()
         ):
+            result_metadata = outcome.result.run_metadata
+            cancelled_metadata = (
+                build_run_metadata(
+                    metadata_context(result_metadata),
+                    outcome.request.config,
+                    boundary_count=len(outcome.request.problem.boundary_conditions),
+                    final_status="cancelled",
+                    elapsed_seconds=result_metadata.elapsed_seconds,
+                    solver_metadata=outcome.result.solver_metadata,
+                    result_data=outcome.result.to_dict(),
+                )
+                if result_metadata is not None
+                else outcome.run_metadata
+            )
             cancelled = SolveOutcome(
                 request=outcome.request,
                 status=SolveOutcomeStatus.CANCELLED,
                 message="Cancellation was observed before auxiliary output processing.",
+                run_metadata=cancelled_metadata,
             )
+            context = self._run_contexts.get(request_id)
+            if context is not None:
+                emit_solver_event(
+                    context,
+                    "solve_cancelled",
+                    phase="solve",
+                    status="cancelled",
+                    details={"checkpoint": "before_auxiliary_outputs"},
+                )
             self.last_cancelled_outcome = cancelled
             self._set_request_task_status(outcome.request, "cancelled")
             self._release_active_request(request_id)
@@ -2090,10 +2211,19 @@ class BvpSolverApp(QMainWindow):
             full_state=full_str,
         )
         mode = result.solver_metadata.get("tolerance_mode", "unknown")
+        run_id_short = (
+            result.run_metadata.run_id[:8] if result.run_metadata else "unknown"
+        )
+        elapsed_seconds = (
+            result.run_metadata.elapsed_seconds if result.run_metadata else 0.0
+        )
         detail = (
+            f"run_id={run_id_short}; "
+            f"request_id={request_id[:8]}; problem={outcome.request.task_name}; "
+            f"method={result.method}; status={result.status}; "
             f"‖Φ‖ = {result.residual_norm:.4e}; "
             f"max_scaled_ratio={result.boundary_max_scaled_ratio:.4e}; "
-            f"tolerance_mode={mode}; request_id={request_id}"
+            f"tolerance_mode={mode}; elapsed_seconds={elapsed_seconds:.6f}"
         )
         if aux_errors:
             detail += "; auxiliary warnings: " + " | ".join(aux_errors)
@@ -2116,7 +2246,7 @@ class BvpSolverApp(QMainWindow):
             diagnostic = outcome.message
             QMessageBox.critical(self, "Solve error", diagnostic)
         if outcome.technical_diagnostic:
-            LOGGER.error(
+            LOGGER.debug(
                 "Technical diagnostic for request %s:\n%s",
                 request_id,
                 outcome.technical_diagnostic,
@@ -2133,7 +2263,8 @@ class BvpSolverApp(QMainWindow):
         self._release_active_request(request_id)
         self._set_gui_state(
             GuiSolveState.CANCELLED,
-            f"request_id={request_id}: {outcome.message}",
+            f"run_id={outcome.run_id[:8] if outcome.run_id else 'unknown'}; "
+            f"request_id={request_id[:8]}; status=cancelled; {outcome.message}",
         )
         LOGGER.info("Solve request %s cancelled", request_id)
 
@@ -2160,6 +2291,7 @@ class BvpSolverApp(QMainWindow):
         failed_components = np.flatnonzero(~component_success).tolist()
         maximum_ratio = result.get("boundary_max_scaled_ratio", float("inf"))
         metadata = result.get("solver_metadata", {})
+        run_metadata = result.get("run_metadata") or {}
         diagnostic_keys = (
             "tolerance_mode",
             "legacy_eps",
@@ -2182,6 +2314,9 @@ class BvpSolverApp(QMainWindow):
         }
         return (
             f"method: {result.get('method', 'unknown')}\n"
+            f"run_id: {run_metadata.get('run_id', 'unknown')}\n"
+            f"request_id: {run_metadata.get('request_id', 'unknown')}\n"
+            f"elapsed_seconds: {run_metadata.get('elapsed_seconds', 'unknown')}\n"
             f"status: {result.get('status', 'unknown')}\n"
             f"message: {result.get('message', 'No diagnostic message')}\n"
             f"optimizer_success: {result.get('optimizer_success', False)}\n"
@@ -2245,6 +2380,20 @@ class BvpSolverApp(QMainWindow):
                 f"{request.request_id}: {type(exc).__name__}: {exc}"
             )
             LOGGER.warning(diagnostic)
+            context = self._run_contexts.get(request.request_id)
+            if context is not None:
+                emit_solver_event(
+                    context,
+                    "auxiliary_output_failed",
+                    phase="auxiliary",
+                    status="failed",
+                    details={
+                        "name": None,
+                        "error_type": type(exc).__name__,
+                        "reason": str(exc),
+                    },
+                    level=logging.WARNING,
+                )
             return {}, np.array([], dtype=float), (diagnostic,)
 
         aux_data: dict[str, np.ndarray] = {}
@@ -2272,6 +2421,20 @@ class BvpSolverApp(QMainWindow):
                 diagnostic = f"auxiliary 'u1/u2' failed: {type(exc).__name__}: {exc}"
                 errors.append(diagnostic)
                 LOGGER.warning("Request %s: %s", request.request_id, diagnostic)
+                context = self._run_contexts.get(request.request_id)
+                if context is not None:
+                    emit_solver_event(
+                        context,
+                        "auxiliary_output_failed",
+                        phase="auxiliary",
+                        status="failed",
+                        details={
+                            "name": "u1/u2",
+                            "error_type": type(exc).__name__,
+                            "reason": str(exc),
+                        },
+                        level=logging.WARNING,
+                    )
 
         for name, expression in problem.auxiliary_expressions.items():
             if name in aux_data:
@@ -2294,6 +2457,20 @@ class BvpSolverApp(QMainWindow):
                 )
                 errors.append(diagnostic)
                 LOGGER.warning("Request %s: %s", request.request_id, diagnostic)
+                context = self._run_contexts.get(request.request_id)
+                if context is not None:
+                    emit_solver_event(
+                        context,
+                        "auxiliary_output_failed",
+                        phase="auxiliary",
+                        status="failed",
+                        details={
+                            "name": name,
+                            "error_type": type(exc).__name__,
+                            "reason": str(exc),
+                        },
+                        level=logging.WARNING,
+                    )
 
         return aux_data, td, tuple(errors)
 
@@ -2596,63 +2773,42 @@ class BvpSolverApp(QMainWindow):
             return
 
         record = self.last_record
-        result = record.result
-        var_names = list(record.request.var_names)
-
-        if path.endswith(".json"):
-            plain_result = result.to_dict()
-            metadata = plain_result["solver_metadata"]
-            tolerance_keys = (
-                "tolerance_mode",
-                "legacy_eps",
-                "effective_ivp_rtol",
-                "effective_ivp_atol",
-                "effective_root_tol",
-                "effective_least_squares_ftol",
-                "effective_least_squares_xtol",
-                "effective_least_squares_gtol",
-                "effective_continuation_residual_tol",
-                "effective_jacobian_relative_step",
+        context = (
+            metadata_context(record.result.run_metadata)
+            if record.result.run_metadata is not None
+            else self._run_contexts.get(record.request_id)
+        )
+        if context is not None:
+            emit_solver_event(
+                context,
+                "export_started",
+                phase="export",
+                status="running",
+                details={"format": "json" if path.lower().endswith(".json") else "text"},
             )
-            export_data = {
-                "request_id": record.request_id,
-                "source_task_id": record.request.source_task_id,
-                "task_name": record.request.task_name,
-                "method": result.method,
-                "iterations": result.iterations,
-                "residual_norm": result.residual_norm,
-                "tolerances": {
-                    key: metadata[key] for key in tolerance_keys if key in metadata
-                },
-                "boundary_acceptance": {
-                    "formula": result.boundary_acceptance,
-                    "atol": result.boundary_atol,
-                    "rtol": result.boundary_rtol,
-                    "scales": result.boundary_scales.tolist(),
-                    "thresholds": result.boundary_thresholds.tolist(),
-                    "component_success": result.boundary_component_success.tolist(),
-                    "scaled_ratios": result.boundary_scaled_ratios.tolist(),
-                    "max_scaled_ratio": result.boundary_max_scaled_ratio,
-                },
-                "p_opt": result.p_opt.tolist(),
-                "var_names": var_names,
-                "t": result.t.tolist(),
-                "y": {name: result.y[i].tolist()
-                      for i, name in enumerate(var_names)},
-            }
-            with open(path, "w", encoding="utf-8") as f:
-                json.dump(export_data, f, indent=2, ensure_ascii=False)
-        else:
-            with open(path, "w") as f:
-                # Header
-                header = "# t" + "".join([f"\t{name}" for name in var_names])
-                f.write(header + "\n")
-                for i in range(len(result.t)):
-                    line = f"{result.t[i]:.8f}"
-                    for j in range(len(var_names)):
-                        line += f"\t{result.y[j, i]:.8f}"
-                    f.write(line + "\n")
-
+        try:
+            canonical = build_canonical_export_record(record)
+            export_canonical_record(path, canonical)
+        except Exception as exc:
+            if context is not None:
+                emit_solver_event(
+                    context,
+                    "export_failed",
+                    phase="export",
+                    status="failed",
+                    details={"error_type": type(exc).__name__, "reason": str(exc)},
+                    level=logging.ERROR,
+                )
+            QMessageBox.critical(self, "Export failed", f"{type(exc).__name__}: {exc}")
+            return
+        if context is not None:
+            emit_solver_event(
+                context,
+                "export_succeeded",
+                phase="export",
+                status="completed",
+                details={"format": "json" if path.lower().endswith(".json") else "text"},
+            )
         self.progress_detail.setText(f"已导出: {path}")
 
     def on_clear(self):
@@ -2664,6 +2820,7 @@ class BvpSolverApp(QMainWindow):
             self.last_cancelled_outcome = None
             self.solve_records.clear()
             self._task_status.clear()
+            self._run_contexts.clear()
             self._refresh_task_table()
             if hasattr(self, "_plot_widget") and self._plot_widget is not None:
                 try:
@@ -2784,7 +2941,9 @@ class BvpSolverApp(QMainWindow):
         self._closing = True
         worker = self.active_worker
         if worker is not None and worker.isRunning():
-            if self.active_cancellation_token is not None:
+            if hasattr(worker, "request_cancel"):
+                worker.request_cancel()
+            elif self.active_cancellation_token is not None:
                 self.active_cancellation_token.cancel()
             if self.solve_state is GuiSolveState.RUNNING:
                 self._set_gui_state(
@@ -2800,7 +2959,17 @@ class BvpSolverApp(QMainWindow):
                     "Window close wait timed out; the worker remains active and the "
                     "window was not destroyed."
                 )
-                LOGGER.error(diagnostic)
+                LOGGER.warning(diagnostic)
+                context = self._run_contexts.get(self.active_request_id or "")
+                if context is not None:
+                    emit_solver_event(
+                        context,
+                        "window_close_wait_timeout",
+                        phase="gui",
+                        status="timeout",
+                        details={"timeout_ms": self.close_wait_timeout_ms},
+                        level=logging.WARNING,
+                    )
                 self.progress_detail.setText(diagnostic)
                 self._closing = False
                 event.ignore()

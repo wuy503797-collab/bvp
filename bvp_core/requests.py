@@ -13,6 +13,7 @@ from uuid import uuid4
 import numpy as np
 
 from .models import BVPProblem, SolverConfig
+from .observability import RunMetadata, stable_problem_signature
 from .results import BVPResult
 
 
@@ -86,7 +87,13 @@ def gui_transition_allowed(current: GuiSolveState, target: GuiSolveState) -> boo
 
 
 class SolveCancelled(RuntimeError):
-    """Raised at a cooperative cancellation checkpoint."""
+    """Raised at a cooperative checkpoint, optionally with completed run facts."""
+
+    def __init__(
+        self, message: str, *, run_metadata: RunMetadata | None = None
+    ) -> None:
+        self.run_metadata = run_metadata
+        super().__init__(message)
 
 
 class CancellationToken:
@@ -190,16 +197,9 @@ class SolveRequest:
         return self.problem.t_start, self.problem.t_end
 
     @property
-    def problem_signature(self) -> tuple[Any, ...]:
-        """Stable in-process signature used to prevent accidental mixed plots."""
-        return (
-            self.problem.var_names,
-            self.problem.odes,
-            self.problem.boundary_conditions,
-            tuple(sorted(self.problem.auxiliary_expressions.items())),
-            self.problem.t_start,
-            self.problem.t_end,
-        )
+    def problem_signature(self) -> str:
+        """Stable cross-process SHA-256 used for provenance and plot isolation."""
+        return stable_problem_signature(self.problem)
 
     def build_initial_state(self, p_opt: np.ndarray) -> np.ndarray:
         """Build the full initial state exclusively from this request snapshot."""
@@ -222,10 +222,24 @@ class SolveOutcome:
     result: BVPResult | None = None
     message: str = ""
     technical_diagnostic: str = ""
+    run_metadata: RunMetadata | None = None
     completed_at: datetime = field(default_factory=_utc_now)
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "status", SolveOutcomeStatus(self.status))
+        metadata = self.run_metadata
+        if metadata is None and self.result is not None:
+            metadata = self.result.run_metadata
+            object.__setattr__(self, "run_metadata", metadata)
+        if metadata is not None:
+            if not isinstance(metadata, RunMetadata):
+                raise TypeError("run_metadata must be a RunMetadata instance or None")
+            if metadata.request_id not in {None, self.request.request_id}:
+                raise ValueError("run_metadata request_id does not match outcome request")
+            if metadata.problem_signature != self.request.problem_signature:
+                raise ValueError(
+                    "run_metadata problem_signature does not match outcome request"
+                )
         if self.status is SolveOutcomeStatus.COMPLETED:
             if self.result is None or not self.result.success:
                 raise ValueError("completed outcome requires a successful BVPResult")
@@ -238,6 +252,10 @@ class SolveOutcome:
     @property
     def request_id(self) -> str:
         return self.request.request_id
+
+    @property
+    def run_id(self) -> str | None:
+        return None if self.run_metadata is None else self.run_metadata.run_id
 
 
 @dataclass(frozen=True)
@@ -262,6 +280,14 @@ class SolveRecord:
             )
         if self.result.y.shape[1] != self.result.t.size:
             raise ValueError("result y sample count does not match result t")
+        if (
+            self.result.run_metadata is not None
+            and self.result.run_metadata.problem_signature
+            != self.request.problem_signature
+        ):
+            raise ValueError(
+                "result run_metadata problem_signature does not match request"
+            )
         sample_t = _readonly_vector(self.auxiliary_sample_t)
         frozen_outputs: dict[str, np.ndarray] = {}
         for name, values in self.auxiliary_outputs.items():
@@ -282,6 +308,11 @@ class SolveRecord:
     @property
     def request_id(self) -> str:
         return self.request.request_id
+
+    @property
+    def run_id(self) -> str | None:
+        metadata = self.result.run_metadata
+        return None if metadata is None else metadata.run_id
 
     def to_legacy_dict(self) -> dict[str, Any]:
         """Build a defensive dictionary only at a legacy GUI/export boundary."""

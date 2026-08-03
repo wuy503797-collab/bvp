@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Any, Optional
@@ -14,6 +15,7 @@ from scipy.optimize import root
 from .exceptions import IVPIntegrationError
 from .expressions import SymPyParser
 from .models import BVPProblem, SolverConfig
+from .observability import RunContext, emit_solver_event
 from .requests import SolveCancelled
 from .tolerances import ResolvedTolerances, evaluate_boundary_acceptance
 
@@ -90,6 +92,7 @@ class BVPSolver:
         config: SolverConfig,
         parser: SymPyParser | None = None,
         cancellation_check: Callable[[], None] | None = None,
+        run_context: RunContext | None = None,
     ) -> None:
         if not isinstance(problem, BVPProblem):
             raise TypeError("problem must be a BVPProblem instance")
@@ -101,6 +104,7 @@ class BVPSolver:
         self.config = config
         self.ds = _SolverInputs.from_models(problem, config)
         self.tolerances = self.ds.tolerances
+        self.run_context = run_context or RunContext.create(problem, config)
         self.parser = parser or SymPyParser(list(problem.odes), list(problem.var_names))
         self.bc_residual = SymPyParser.parse_boundary_conditions(
             list(problem.boundary_conditions), list(problem.var_names)
@@ -111,6 +115,24 @@ class BVPSolver:
     def _check_cancelled(self) -> None:
         if self._cancellation_check is not None:
             self._cancellation_check()
+
+    def _emit(
+        self,
+        event_name: str,
+        *,
+        phase: str,
+        status: str | None = None,
+        details: dict[str, Any] | None = None,
+        level: int = logging.INFO,
+    ) -> None:
+        emit_solver_event(
+            self.run_context,
+            event_name,
+            phase=phase,
+            status=status,
+            details=details,
+            level=level,
+        )
 
     def _build_initial_state_mapper(self):
         """
@@ -141,6 +163,13 @@ class BVPSolver:
                    dense_output: bool = False) -> Any:
         """Solve the inner IVP and preserve diagnostics for every failure."""
         self._check_cancelled()
+        self._emit(
+            "ivp_started",
+            phase="ivp",
+            status="running",
+            details={"method": self.ds.method, "dense_output": dense_output},
+            level=logging.DEBUG,
+        )
         x0 = self._p_to_state(p)
         try:
             sol = solve_ivp(
@@ -151,6 +180,13 @@ class BVPSolver:
                 atol=self.tolerances.ivp_atol,
             )
         except Exception as exc:
+            self._emit(
+                "ivp_failed",
+                phase="ivp",
+                status="exception",
+                details={"error_type": type(exc).__name__, "message": str(exc)},
+                level=logging.WARNING,
+            )
             raise IVPIntegrationError(
                 f"solve_ivp raised {type(exc).__name__}: {exc}", p=p
             ) from exc
@@ -178,6 +214,18 @@ class BVPSolver:
                 f"success={bool(sol.success)}, status={getattr(sol, 'status', None)}, "
                 f"t_final={t_final}, finite={state_finite}, "
                 f"message={getattr(sol, 'message', '')}"
+            )
+            self._emit(
+                "ivp_failed",
+                phase="ivp",
+                status="failed",
+                details={
+                    "ivp_status": getattr(sol, "status", None),
+                    "ivp_message": getattr(sol, "message", ""),
+                    "ivp_t_final": t_final,
+                    "state_finite": state_finite,
+                },
+                level=logging.WARNING,
             )
             raise IVPIntegrationError(message, sol, p=p)
         return sol
@@ -289,7 +337,34 @@ class BVPSolver:
         # Effective values are authoritative and cannot be shadowed by
         # algorithm-specific metadata assembled along the solve path.
         metadata.update(self.tolerances.to_metadata())
+        metadata.update(
+            {
+                "run_id": self.run_context.run_id,
+                "request_id": self.run_context.request_id,
+                "problem_signature": self.run_context.problem_signature,
+            }
+        )
         metadata["boundary_thresholds"] = boundary_check.thresholds.tolist()
+        self._emit(
+            "final_validation_completed",
+            phase="final_validation",
+            status=status,
+            details={
+                "success": success,
+                "ivp_success": ivp_success,
+                "algorithm_success": algorithm_success,
+                "boundary_success": boundary_success,
+                "boundary_max_scaled_ratio": boundary_check.max_scaled_ratio,
+            },
+        )
+        if method == "continuation" and not algorithm_success:
+            self._emit(
+                "continuation_failed",
+                phase="continuation",
+                status=status,
+                details={"failure_reason": failure_message or message},
+                level=logging.WARNING,
+            )
         return {
             "success": success,
             "status": status,
@@ -599,6 +674,12 @@ class BVPSolver:
                 "message": optimizer_message,
                 "nfev": getattr(root_result, "nfev", None),
             }
+            self._emit(
+                "root_completed",
+                phase="root",
+                status="succeeded" if optimizer_success else "failed",
+                details=solver_metadata["root"],
+            )
         except SolveCancelled:
             raise
         except IVPIntegrationError as exc:
@@ -606,6 +687,13 @@ class BVPSolver:
                 "success": False,
                 "message": str(exc),
             }
+            self._emit(
+                "root_completed",
+                phase="root",
+                status="ivp_failed",
+                details=solver_metadata["root"],
+                level=logging.WARNING,
+            )
             return self._build_ivp_failure_result(
                 p=candidate,
                 method="shooting",
@@ -620,6 +708,16 @@ class BVPSolver:
                 "success": False,
                 "message": optimizer_message,
             }
+            self._emit(
+                "root_completed",
+                phase="root",
+                status="exception",
+                details={
+                    "error_type": type(exc).__name__,
+                    "message": optimizer_message,
+                },
+                level=logging.WARNING,
+            )
 
         # Попытка 2: least_squares. Нормальное завершение оптимизатора не
         # является критерием выполнения граничных условий.
@@ -627,6 +725,11 @@ class BVPSolver:
             self._check_cancelled()
             solver_metadata["fallback_used"] = True
             solver_metadata["optimizer"] = "least_squares"
+            self._emit(
+                "least_squares_started",
+                phase="least_squares",
+                status="running",
+            )
             if callback:
                 callback("shooting", 0, "hybr не сошёлся, пробуем least_squares...")
             try:
@@ -650,7 +753,14 @@ class BVPSolver:
                     "cost": getattr(ls_result, "cost", None),
                     "optimality": getattr(ls_result, "optimality", None),
                     "nfev": getattr(ls_result, "nfev", None),
+                    "njev": getattr(ls_result, "njev", None),
                 }
+                self._emit(
+                    "least_squares_completed",
+                    phase="least_squares",
+                    status="succeeded" if optimizer_success else "failed",
+                    details=solver_metadata["least_squares"],
+                )
             except SolveCancelled:
                 raise
             except IVPIntegrationError as exc:
@@ -658,6 +768,13 @@ class BVPSolver:
                     "success": False,
                     "message": str(exc),
                 }
+                self._emit(
+                    "least_squares_completed",
+                    phase="least_squares",
+                    status="ivp_failed",
+                    details=solver_metadata["least_squares"],
+                    level=logging.WARNING,
+                )
                 return self._build_ivp_failure_result(
                     p=candidate,
                     method="shooting",
@@ -674,6 +791,16 @@ class BVPSolver:
                     "success": False,
                     "message": optimizer_message,
                 }
+                self._emit(
+                    "least_squares_completed",
+                    phase="least_squares",
+                    status="exception",
+                    details={
+                        "error_type": type(exc).__name__,
+                        "message": optimizer_message,
+                    },
+                    level=logging.WARNING,
+                )
 
         self._check_cancelled()
         result = self._validate_final_candidate(
@@ -956,6 +1083,20 @@ class BVPSolver:
                 break
 
             solver_metadata["steps"].append(step_metadata)
+            self._emit(
+                "continuation_step_completed",
+                phase="continuation",
+                status=(
+                    "converged" if step_metadata["newton_converged"] else "failed"
+                ),
+                details={
+                    "step": step,
+                    "mu": mu,
+                    "newton_updates": step_metadata["newton_updates"],
+                    "residual_norm": step_metadata["residual_norm"],
+                },
+                level=logging.DEBUG,
+            )
             if callback and step % max(1, N // 10) == 0:
                 progress = int(100 * step / N)
                 callback(
