@@ -1,5 +1,7 @@
-numpy
-scipy
-sympy
-matplotlib
-PyQt5
+# Direct runtime dependency ranges for Python 3.11.
+# CI validates a resolved combination; it does not promise every possible one.
+numpy>=2.4,<2.5
+scipy>=1.17,<1.18
+sympy>=1.14,<1.15
+matplotlib>=3.10,<3.11
+PyQt5>=5.15,<5.16

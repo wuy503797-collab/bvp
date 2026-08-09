@@ -5,11 +5,16 @@ __pycache__/
 *.egg-info/
 dist/
 build/
+.pytest_cache/
+.coverage
+htmlcov/
+baseline-output/
 
 # Virtual environment
 venv/
 .env
 .venv
+.venv-*/
 
 # IDE
 .vscode/

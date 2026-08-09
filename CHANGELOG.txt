@@ -1,6 +1,105 @@
 CHANGELOG
 =========
 
+v2.10 (2026-08)
+- 删除全局 Matplotlib 实验性 toolmanager 设置，保留 NavigationToolbar2QT，并将默认 pytest 警告清零
+- 修复同一任务不同数值输入被错误隔离的问题，覆盖初始猜测、方程/边界数值、已知初值、区间、方法、容差和延拓步数；冻结每次主曲线采样并支持 26.1 多解分支同时勾选和叠加
+- 审计运行、开发和精确参考依赖；明确 requirements-lock 只锁定直接依赖而非全部传递依赖
+- 新增统一 CI 验证脚本，串联 pip check、无警告导入、compileall、pytest 和全部确定性阶段验证
+- 为性能验证增加 --ci 模式，只检查数值等价、Jacobian、Phi 复用、计数器和导出，不设置耗时门槛
+- 新增只读仓库卫生、有限秘密模式、README 路径、本机绝对路径、缓存和大文件检查
+- 新增 GitHub Actions，在 Windows/Linux 的 Python 3.11 范围环境和 Ubuntu 精确直接依赖参考环境运行
+- 新增 CONTRIBUTING.md 与 SECURITY.md，明确数值证据、安全边界和离屏 GUI 回归要求
+- 整理 README 的干净环境、CI、仓库卫生、适用范围、架构和发布前决策说明
+- 保留课程/项目 PDF、示例 JSON、负向数据、空 gui.py 和独立 26.1 基线，不在本阶段混合删除
+- 仓库仍无 LICENSE；许可证选择保留为发布前用户决策
+- 状态输出区分本地验证与远端 CI：本地为 PASS，推送前发布准备保持 PENDING_REMOTE_CI_AND_LICENSE
+
+v2.9 (2026-08)
+- 新增 SolverCounters 与不可变快照，区分 Phi、Jacobian、IVP、底层 nfev、root/least-squares、延拓、Newton、阻尼和最终验收
+- 为 RunMetadata 增加 core/API 时间边界和性能计数，保持既有 elapsed_seconds 的公共 API 总时间语义
+- 建立指数、振子、制造解、26.1 打靶/延拓、无实根和奇异 IVP 的预热及重复中位数基准
+- 确认变分积分生成的 XT 未参与最终 Jacobian，并删除每次 Jacobian 的冗余变分 IVP
+- 在同一 Newton 参数快照内复用已计算的 Phi_current，保留原前向差分方向、步长和异常传播
+- 26.1 延拓同进程参考中 IVP 874→600、总 nfev 131732→94200，Jacobian 数组和最终数值结果不变
+- 当前机器 3 次核心中位耗时约 0.956s→0.617s；该数据仅为本机证据，不作为测试时间门槛或跨机器承诺
+- 验证每次公共 API 求解只解析、lambdify 和编译边界一次；未增加跨任务全局缓存
+- 默认日志级别关闭时在创建 solver 事件前短路，保留关键事件、结果不可变性和独立最终验收 IVP
+- 新增同进程旧工作量参考与当前实现的性能验证脚本；记录最终验收、GUI 兼容复制等暂不优化热点
+
+v2.8 (2026-08)
+- 新增 UUID run_id、稳定 SHA-256 problem_signature、不可变 RunContext 和 RunMetadata
+- 核心 API、worker、成功、数值失败、取消和编程异常统一关联运行身份与 perf_counter 耗时
+- 新增标准库 logging 结构化事件，核心仅安装 NullHandler，不配置全局 handler 或控制台输出
+- 规范 root、least_squares、延拓和 IVP 的真实可用诊断，并补充 least_squares njev
+- 新增 bvp-result-v1 CanonicalExportRecord，JSON 与 TXT 共享问题、配置、结果和诊断事实源
+- JSON 使用严格 UTF-8/allow_nan=False；非有限失败诊断使用显式标记，排除原始 SciPy 对象
+- JSON、TXT 和任务库保存统一采用同目录临时文件、fsync 与 os.replace 原子替换
+- GUI 显示 run/request 关联、状态、容差模式、边界比值和耗时，并记录过期/重复信号与导出事件
+- 增加日志截断、路径和 opaque 对象脱敏，以及导出环境信息最小化隐私边界
+- 新增成功、失败、奇异 IVP、取消、Unicode、原子失败和统一导出终端验收
+
+v2.7 (2026-08)
+- 将 IVP、root、least_squares、延拓 Newton、参数 Jacobian 和最终边界验收容差拆分为显式语义
+- 保留旧 eps 与旧 JSON，并在唯一解析入口按原映射补全未显式提供的过程容差
+- 支持部分覆盖和 eps=None 的全显式 Python/JSON 配置，记录有效值、来源和 legacy/explicit 模式
+- 最终边界验收改为 boundary_atol + boundary_rtol * boundary_scales 的逐分量判据，不自动推断问题尺度
+- 结果新增边界尺度、阈值、逐分量状态、尺度化比值和最大比值只读诊断
+- GUI 基础精度控件保持 legacy 模式，失败显示和 JSON 导出增加有效容差与边界诊断
+- 新增容差映射、过程独立性、legacy/explicit 数值等价和 JSON 兼容测试及终端验收脚本
+
+v2.6 (2026-08)
+- 将 GUI/JSON 外部表达式统一收口到受限 AST-to-SymPy 解析入口，不再使用 parse_expr 或自动创建未知对象
+- 为 ODE、边界条件、辅助输出和 GUI 标量初值建立独立符号上下文
+- 明确算术运算、数学函数、常量与 ASCII 标识符白名单，并拒绝名称冲突
+- 在 SymPy 构造前拒绝属性、下标、Lambda、推导式、容器、字符串、任意调用和多语句输入
+- 增加表达式长度、AST 节点、嵌套、数值字面量、函数调用和幂运算复杂度限制
+- 新增带上下文、字段序号、错误码、截断预览和原因的 ExpressionValidationError
+- GUI 在创建 worker 前显示表达式验证错误；辅助表达式失败继续逐项隔离
+- 新增危险输入、合法语法、全部任务文件和离屏 GUI 安全回归测试及独立验收脚本
+
+v2.5 (2026-08)
+- 将 SymPyParser 唯一实现迁入 bvp_core.expressions，保持现有表达式行为
+- 将 IVPIntegrationError 唯一实现迁入 bvp_core.exceptions，保留完整 IVP 诊断
+- 将 BVPSolver 数值实现迁入 bvp_core.solver，算法、容差、分支顺序和结果字段不变
+- bvp_core.api 删除对 main.py 的运行时延迟导入，实际求解不加载 main 或 PyQt5
+- main.py 改为核心类兼容导入，Dataset 继续作为 GUI/JSON 适配层
+- SolverWorker 继续使用不可变 SolveRequest，并统一调用公共核心 API
+- 新增表达式、求解器、导入边界、旧入口兼容和唯一实现契约测试
+- 第三阶段解析解、制造解和 ODE 数值一致性指标保持不变
+
+v2.4 (2026-08)
+- 新增不可变 SolveRequest、唯一 request_id 和来源快照
+- 新增 SolveRecord 成功历史及结构化完成、失败和取消事件
+- worker 信号绑定 request_id，过滤过期信号和重复终端信号
+- 新增集中 GUI 求解状态、单活动请求守卫和协作式取消
+- 窗口关闭时请求取消并有限等待，不使用 QThread.terminate
+- 辅助输出、绘图和导出改用结果自身的问题与变量快照
+- 不兼容跨任务结果默认隔离，辅助表达式失败保留逐项诊断
+
+v2.3 (2026-08)
+- 新增不依赖 GUI 生命周期的 bvp_core 公开入口
+- 新增不可变 BVPProblem、SolverConfig 和 BVPResult 模型
+- 明确区分问题定义错误与正常返回的数值求解失败
+- 新增旧 Dataset/结果字典兼容适配层，GUI 和现有 JSON 字段保持兼容
+- 数值验证脚本改用公开 API，解析解与制造解基线保持不变
+- 记录过渡性技术债务：求解时仍延迟复用 main.py 中的解析器和求解器；第五阶段不扩大依赖，第六阶段再迁移
+
+v2.2 (2026-08)
+- 新增标量指数和简谐振子解析解测试
+- 新增非齐次两状态制造解测试
+- 新增未知参数、状态最大误差和 RMS 误差指标
+- 新增独立边界回代与 Simpson 积分 ODE 缺陷指标
+- 新增容差敏感性和重复性验证脚本
+
+v2.1 (2026-08)
+- 打靶法不再把优化器终止直接视为有效 BVP 解
+- least_squares fallback 必须通过最终独立边界残差验收
+- 参数延拓法不再在 Newton、Jacobian 或阻尼失败后无条件返回成功
+- IVP 失败会保留底层状态、消息、积分终止位置和有限性诊断
+- 边界条件与未知初值参数维数不一致会在调用 SciPy 前被拒绝
+- GUI 不再把无效结果显示为绿色成功、加入有效历史、绘图或导出
+
 v2.0 (2026-05)
 - Интегрированная визуализация (IntegratedPlotWidget)
 - Поддержка двух языков (китайский / русский)

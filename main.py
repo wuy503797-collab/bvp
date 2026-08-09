@@ -16,8 +16,7 @@
 
 Архитектура:
   - Dataset      : dataclass для хранения параметров задачи
-  - SymPyParser  : безопасный парсинг уравнений через SymPy
-  - BVPSolver    : ядро — метод стрельбы и продолжения по параметру
+  - bvp_core     : SymPy parsing and numerical BVP implementation
   - SolverWorker : QThread для неблокирующих вычислений
   - PlotDialog   : универсальный диалог выбора осей графика
   - BvpSolverApp : PyQt5 GUI
@@ -27,23 +26,19 @@
 
 import sys
 import json
+import logging
 import re
+import time
+import traceback
 import warnings
 from dataclasses import dataclass, field, asdict
 from typing import List, Callable, Optional, Tuple, Dict, Any
+from uuid import uuid4
 
 import numpy as np
-from numpy.linalg import norm, solve as np_solve
-from scipy.integrate import solve_ivp
-from scipy.optimize import root
-
-import sympy as sp
-from sympy.parsing.sympy_parser import parse_expr, standard_transformations
-from sympy.utilities.lambdify import lambdify
 
 import matplotlib
 matplotlib.use("Qt5Agg")
-matplotlib.rcParams["toolbar"] = "toolmanager"
 import matplotlib.pyplot as plt
 from matplotlib.backends.backend_qt5agg import FigureCanvasQTAgg as FigureCanvas
 from matplotlib.backends.backend_qt5agg import NavigationToolbar2QT as NavigationToolbar
@@ -63,6 +58,42 @@ from PyQt5.QtWidgets import (
 )
 from PyQt5.QtCore import Qt, QThread, pyqtSignal, QSize
 from PyQt5.QtGui import QFont, QKeySequence, QColor
+
+from bvp_core import (
+    RunContext,
+    build_canonical_export_record,
+    emit_solver_event,
+    export_canonical_record,
+    solve_bvp_problem,
+)
+from bvp_core.adapters import (
+    config_from_dataset,
+    problem_from_dataset,
+    solver_from_dataset as BVPSolver,
+)
+from bvp_core.exceptions import ExpressionValidationError, IVPIntegrationError
+from bvp_core.expressions import SymPyParser
+from bvp_core.requests import (
+    CancellationToken,
+    GuiSolveState,
+    SolveCancelled,
+    SolveOutcome,
+    SolveOutcomeStatus,
+    SolveRecord,
+    SolveRequest,
+    gui_transition_allowed,
+    partition_plot_records,
+)
+from bvp_core.results import BVPResult
+from bvp_core.observability import build_run_metadata, metadata_context
+from bvp_core.serialization import write_json_data_atomic
+
+
+LOGGER = logging.getLogger(__name__)
+
+
+def _optional_float(value: Any) -> Optional[float]:
+    return None if value is None else float(value)
 
 # ---------------------------------------------------------------------------
 # 1. Dataset — централизованное хранение параметров задачи
@@ -88,7 +119,20 @@ class Dataset:
     # Начальное приближение для НЕИЗВЕСТНЫХ начальных значений (по порядку индексов)
     guess: List[float] = field(default_factory=list)
     # Параметры интегрирования
-    eps: float = 1e-8
+    eps: Optional[float] = 1e-8
+    # Независимый критерий приёмки конечной граничной невязки.
+    # Финальная приёмка использует явные покомпонентные масштабы.
+    boundary_atol: float = 1e-8
+    boundary_rtol: float = 0.0
+    boundary_scales: Optional[List[float]] = None
+    ivp_rtol: Optional[float] = None
+    ivp_atol: Optional[float] = None
+    root_tol: Optional[float] = None
+    least_squares_ftol: Optional[float] = None
+    least_squares_xtol: Optional[float] = None
+    least_squares_gtol: Optional[float] = None
+    continuation_residual_tol: Optional[float] = None
+    jacobian_relative_step: Optional[float] = None
     method: str = "RK45"
     # Выбор метода решения: "shooting" | "continuation"
     solver_method: str = "continuation"
@@ -117,6 +161,19 @@ class Dataset:
             "boundary_conditions": self.boundary_conditions,
             "guess": self.guess,
             "eps": self.eps,
+            "boundary_atol": self.boundary_atol,
+            "boundary_rtol": self.boundary_rtol,
+            "boundary_scales": (
+                None if self.boundary_scales is None else list(self.boundary_scales)
+            ),
+            "ivp_rtol": self.ivp_rtol,
+            "ivp_atol": self.ivp_atol,
+            "root_tol": self.root_tol,
+            "least_squares_ftol": self.least_squares_ftol,
+            "least_squares_xtol": self.least_squares_xtol,
+            "least_squares_gtol": self.least_squares_gtol,
+            "continuation_residual_tol": self.continuation_residual_tol,
+            "jacobian_relative_step": self.jacobian_relative_step,
             "method": self.method,
             "solver_method": self.solver_method,
             "continuation_steps": self.continuation_steps,
@@ -148,7 +205,24 @@ class Dataset:
             initial_values=initial_values,
             boundary_conditions=list(d.get("boundary_conditions", [])),
             guess=list(d.get("guess", [])),
-            eps=float(d.get("eps", 1e-8)),
+            eps=None if d.get("eps", 1e-8) is None else float(d.get("eps", 1e-8)),
+            boundary_atol=float(d.get("boundary_atol", 1e-8)),
+            boundary_rtol=float(d.get("boundary_rtol", 0.0)),
+            boundary_scales=(
+                None
+                if d.get("boundary_scales") is None
+                else [float(value) for value in d["boundary_scales"]]
+            ),
+            ivp_rtol=_optional_float(d.get("ivp_rtol")),
+            ivp_atol=_optional_float(d.get("ivp_atol")),
+            root_tol=_optional_float(d.get("root_tol")),
+            least_squares_ftol=_optional_float(d.get("least_squares_ftol")),
+            least_squares_xtol=_optional_float(d.get("least_squares_xtol")),
+            least_squares_gtol=_optional_float(d.get("least_squares_gtol")),
+            continuation_residual_tol=_optional_float(
+                d.get("continuation_residual_tol")
+            ),
+            jacobian_relative_step=_optional_float(d.get("jacobian_relative_step")),
             method=d.get("method", "RK45"),
             solver_method=d.get("solver_method", "continuation"),
             continuation_steps=int(d.get("continuation_steps", 50)),
@@ -165,599 +239,157 @@ class Dataset:
         return len(self.unknown_indices)
 
     def validate(self) -> List[str]:
-        """Возвращает список ошибок валидации (пустой = ОК)."""
-        errors = []
-        n = self.dim()
-        if n == 0:
-            errors.append("Уравнения не заданы")
-        if not self.boundary_conditions:
-            errors.append("Граничные условия не заданы")
-        if len(self.initial_values) != n:
-            errors.append(
-                f"Начальные значения: задано {len(self.initial_values)}, "
-                f"ожидается {n}"
-            )
-        if not self.unknown_indices:
-            errors.append("Нет неизвестных начальных условий (unknown_indices пуст)")
-        if len(self.guess) != len(self.unknown_indices):
-            errors.append(
-                f"Приближение: guess={len(self.guess)}, "
-                f"неизвестных={len(self.unknown_indices)}"
-            )
+        """Return core-model validation errors while preserving the legacy list API."""
+        from bvp_core.adapters import config_from_dataset, problem_from_dataset
+        from bvp_core.models import BVPValidationError
+
+        errors: List[str] = []
+        problem = None
+        try:
+            problem = problem_from_dataset(self)
+        except BVPValidationError as exc:
+            errors.extend(exc.errors)
+        try:
+            config_from_dataset(self)
+        except BVPValidationError as exc:
+            errors.extend(exc.errors)
+        if problem is not None:
+            try:
+                parser = SymPyParser(list(problem.odes), list(problem.var_names))
+                parser.lambdify_all()
+                SymPyParser.parse_boundary_conditions(
+                    list(problem.boundary_conditions), list(problem.var_names)
+                )
+            except ExpressionValidationError as exc:
+                errors.extend(exc.errors)
         return errors
 
 
-# ---------------------------------------------------------------------------
-# 2. SymPyParser — безопасный парсинг уравнений
-# ---------------------------------------------------------------------------
-
-class SymPyParser:
-    """
-    Безопасный парсер математических выражений через SymPy.
-    Преобразует список строк уравнений в callable NumPy-функцию.
-    """
-
-    # Разрешённые символы — белый список
-    ALLOWED_NAMES = {
-        "sin", "cos", "tan", "exp", "log", "sqrt",
-        "pi", "E", "abs", "sign", "atan", "asin", "acos",
-        "sinh", "cosh", "tanh", "atan2",
-        # константы
-        "inf", "nan",
-    }
-
-    def __init__(self, equations: List[str], var_names: List[str]):
-        """
-        equations: список строк правых частей ODE
-        var_names: имена переменных состояния (x0, x1, ...)
-        """
-        self.equations_str = equations
-        self.var_names = var_names
-        self.n = len(equations)
-        # SymPy символы: t, x0, x1, ...
-        self.t_sym = sp.Symbol("t", real=True)
-        self.x_syms = [sp.Symbol(v, real=True) for v in var_names]
-        self.all_syms = [self.t_sym] + self.x_syms
-        # Распарсенные выражения
-        self.parsed_exprs: List[sp.Expr] = []
-        # Якобиан (n x n матрица выражений)
-        self.jacobian_exprs: Optional[sp.Matrix] = None
-        # lambdified функции
-        self.ode_fn: Optional[Callable] = None
-        self.jac_fn: Optional[Callable] = None
-
-    def parse(self) -> None:
-        """Парсинг всех выражений и построение Якобиана."""
-        local_dict = {s.name: s for s in self.all_syms}
-        # Разрешённые функции и типы из SymPy (нужны для standard_transformations)
-        global_dict = {name: getattr(sp, name) for name in self.ALLOWED_NAMES
-                       if hasattr(sp, name)}
-        global_dict.update({
-            "pi": sp.pi, "E": sp.E, "inf": sp.oo,
-            "Integer": sp.Integer, "Float": sp.Float, "Rational": sp.Rational,
-        })
-
-        self.parsed_exprs = []
-        for eq_str in self.equations_str:
-            expr = parse_expr(
-                eq_str,
-                local_dict=local_dict,
-                global_dict=global_dict,
-                transformations=standard_transformations,
-                evaluate=True,
-            )
-            self.parsed_exprs.append(expr)
-
-        # Якобиан: ∂f_i/∂x_j
-        self.jacobian_exprs = sp.Matrix(self.parsed_exprs).jacobian(self.x_syms)
-
-    def lambdify_all(self) -> None:
-        """Преобразование в NumPy-совместимые функции."""
-        if not self.parsed_exprs:
-            self.parse()
-
-        # ODE функция: f(t, x) -> array(n)
-        self.ode_fn = lambdify(self.all_syms, self.parsed_exprs, modules="numpy")
-
-        # Якобиан: J(t, x) -> array(n, n)
-        if self.jacobian_exprs is not None:
-            flat_jac = list(self.jacobian_exprs)
-            self.jac_fn = lambdify(self.all_syms, flat_jac, modules="numpy")
-
-    def f(self, t: float, x: np.ndarray) -> np.ndarray:
-        """Обертка: f(t, x) -> dx/dt"""
-        if self.ode_fn is None:
-            self.lambdify_all()
-        args = [t] + list(x)
-        return np.array(self.ode_fn(*args), dtype=float)
-
-    def jac(self, t: float, x: np.ndarray) -> np.ndarray:
-        """Обертка: Jacobian J(t,x) = ∂f/∂x"""
-        if self.jac_fn is None:
-            self.lambdify_all()
-        args = [t] + list(x)
-        flat = np.array(self.jac_fn(*args), dtype=float)
-        return flat.reshape(self.n, self.n)
-
-    # ---- вспомогательные выходные переменные ----
-
-    def parse_aux(self, aux_outputs: Dict[str, str]) -> Dict[str, sp.Expr]:
-        """Парсит вспомогательные переменные. Возвращает {name: expr}."""
-        local_dict = {s.name: s for s in self.all_syms}
-        global_dict = {name: getattr(sp, name) for name in self.ALLOWED_NAMES
-                       if hasattr(sp, name)}
-        global_dict.update({
-            "pi": sp.pi, "E": sp.E, "inf": sp.oo,
-            "Integer": sp.Integer, "Float": sp.Float, "Rational": sp.Rational,
-        })
-        parsed = {}
-        for name, expr_str in aux_outputs.items():
-            expr = parse_expr(
-                expr_str,
-                local_dict=local_dict,
-                global_dict=global_dict,
-                transformations=standard_transformations,
-                evaluate=True,
-            )
-            parsed[name] = expr
-        return parsed
-
-    def lambdify_aux(self, aux_outputs: Dict[str, str]) -> Dict[str, Callable]:
-        """lambdify вспомогательных переменных. Возвращает {name: fn(t,x0,x1,...)}."""
-        parsed = self.parse_aux(aux_outputs)
-        fns = {}
-        for name, expr in parsed.items():
-            fns[name] = lambdify(self.all_syms, expr, modules="numpy")
-        return fns
-
-    @staticmethod
-    def parse_boundary_conditions(
-        bc_strings: List[str],
-        var_names: List[str]
-    ) -> Callable:
-        """
-        Парсит граничные условия вида ["x0_T - 1.0738644361", "x2_T + 1.0995343576"]
-        и возвращает функцию residual(x0, xT) -> np.ndarray.
-
-        Переменные в BC (универсальный формат по индексам):
-            x0_0, x1_0, ..., x{n-1}_0 — значения в t=0
-            x0_T, x1_T, ..., x{n-1}_T — значения в t=T
-        """
-        n = len(var_names)
-        # Используем ТОЛЬКО индексные имена — универсальные и не зависят от var_names
-        symbols_0 = [sp.Symbol(f"x{i}_0", real=True) for i in range(n)]
-        symbols_T = [sp.Symbol(f"x{i}_T", real=True) for i in range(n)]
-        all_bc_syms = symbols_0 + symbols_T
-
-        local_dict = {s.name: s for s in all_bc_syms}
-        # Только необходимое — без Integer/Float чтобы избежать Symbol not defined
-        global_dict = {
-            "pi": sp.pi, "E": sp.E,
-            "Integer": sp.Integer, "Float": sp.Float, "Rational": sp.Rational,
-            "sin": sp.sin, "cos": sp.cos, "tan": sp.tan,
-            "exp": sp.exp, "log": sp.log, "sqrt": sp.sqrt,
-            "abs": sp.Abs, "sign": sp.sign,
-            "atan": sp.atan, "asin": sp.asin, "acos": sp.acos,
-            "sinh": sp.sinh, "cosh": sp.cosh, "tanh": sp.tanh,
-            "atan2": sp.atan2,
-        }
-
-        parsed_bcs = []
-        for bc_str in bc_strings:
-            s_clean = bc_str.strip()
-            if s_clean == "":
-                continue
-            try:
-                expr = parse_expr(
-                    s_clean,
-                    local_dict=local_dict,
-                    global_dict=global_dict,
-                    transformations=standard_transformations,
-                    evaluate=True,
-                )
-                parsed_bcs.append(expr)
-            except Exception as e:
-                raise ValueError(f"Ошибка парсинга BC '{s_clean}': {e}")
-
-        if not parsed_bcs:
-            raise ValueError("Нет валидных граничных условий")
-
-        lambdified_bcs = lambdify(all_bc_syms, parsed_bcs, modules="numpy")
-
-        def residual(x0: np.ndarray, xT: np.ndarray) -> np.ndarray:
-            args = list(x0) + list(xT)
-            return np.array(lambdified_bcs(*args), dtype=float)
-
-        return residual
-
+def is_result_acceptable(result: dict) -> bool:
+    """Return whether a solver result may enter GUI history, plots, and export."""
+    required_flags = ("success", "ivp_success", "finite_success", "boundary_success")
+    return all(result.get(flag) is True for flag in required_flags)
 
 # ---------------------------------------------------------------------------
-# 3. BVPSolver — ядро: метод стрельбы + продолжения по параметру
-# ---------------------------------------------------------------------------
-
-class BVPSolver:
-    """
-    Универсальный решатель краевых задач.
-    Реализует:
-      - Метод стрельбы (shooting) через scipy.optimize.root
-      - Метод продолжения по параметру (continuation / homotopy)
-        см. разд. 7.25–7.26 методички.
-    """
-
-    def __init__(self, dataset: Dataset, parser: SymPyParser):
-        self.ds = dataset
-        self.parser = parser
-        # Граничные условия как функция
-        self.bc_residual = SymPyParser.parse_boundary_conditions(
-            dataset.boundary_conditions, dataset.var_names
-        )
-        self._build_initial_state_mapper()
-
-    def _build_initial_state_mapper(self):
-        """
-        Строит маппер: вектор параметров p -> полный вектор начального состояния.
-        known_indices  — фиксированные значения из initial_values
-        unknown_indices — искомые (подставляются из p)
-        """
-        self.known = sorted(self.ds.known_indices)
-        self.unknown = sorted(self.ds.unknown_indices)
-        self.known_vals = {}
-        for idx in self.known:
-            self.known_vals[idx] = float(self.ds.initial_values[idx])
-
-    def _p_to_state(self, p: np.ndarray) -> np.ndarray:
-        """Собирает полный вектор x(t*) из параметров p (неизвестные)."""
-        state = np.zeros(self.ds.dim())
-        for idx in self.known:
-            state[idx] = self.known_vals[idx]
-        for i, idx in enumerate(self.unknown):
-            state[idx] = p[i]
-        return state
-
-    def _state_to_p(self, state: np.ndarray) -> np.ndarray:
-        """Извлекает параметры p из полного состояния."""
-        return state[self.unknown]
-
-    def _solve_ivp(self, p: np.ndarray, t_span: List[float],
-                   dense_output: bool = False) -> Any:
-        """Решает внутреннюю задачу Коши для параметров p."""
-        x0 = self._p_to_state(p)
-        sol = solve_ivp(
-            self.parser.f, t_span, x0,
-            method=self.ds.method,
-            dense_output=dense_output,
-            rtol=self.ds.eps, atol=self.ds.eps / 10,
-        )
-        if not sol.success:
-            raise RuntimeError("solve_ivp не сошёлся")
-        return sol
-
-    def _Phi(self, p: np.ndarray) -> np.ndarray:
-        """
-        Вычисляет вектор невязки граничных условий Φ(p).
-        Φ(p) = R(x(t*,p), x(T,p)).
-
-        Интегрирование всегда на фиксированном отрезке [t_star, T].
-        Для задач с нормировкой времени (напр. 26.4) переменная T
-        входит в уравнения как параметр-множитель, а интервал
-        интегрирования остаётся [0, 1] (ds.T = 1.0).
-        """
-        sol = self._solve_ivp(p, [self.ds.t_star, self.ds.T])
-        x0_full = self._p_to_state(p)
-        xT_full = sol.y[:, -1]
-        return self.bc_residual(x0_full, xT_full)
-
-    def _dPhi_dp(self, p: np.ndarray) -> np.ndarray:
-        """
-        Вычисляет матрицу Φ'(p).
-
-        Стратегия:
-          1. Пробуем совместное интегрирование + вариационное уравнение.
-          2. При неудаче — чистое численное дифференцирование (надёжный fallback).
-        """
-        k = len(self.unknown)
-        # Определяем размерность Φ(p) реальным вызовом
-        Phi_base = self._Phi(p)
-        m = len(Phi_base)
-        n = self.ds.dim()
-        T = self.ds.T
-
-        # --- Попытка 1: совместное интегрирование состояния + вариаций ---
-        try:
-            x0 = self._p_to_state(p)
-            X0 = np.eye(n)
-            y0 = np.concatenate([x0, X0.flatten()])
-
-            def combined_ode(t, y):
-                x = y[:n]
-                Xmat = y[n:].reshape(n, n)
-                try:
-                    J = self.parser.jac(t, x)
-                except Exception:
-                    # Fallback: численный якобиан если аналитический не доступен
-                    J = self._numerical_jac_f(t, x)
-                dxdt = self.parser.f(t, x)
-                dXdt = J @ Xmat
-                return np.concatenate([dxdt, dXdt.flatten()])
-
-            sol = solve_ivp(
-                combined_ode, [self.ds.t_star, T], y0,
-                method="RK45",
-                rtol=max(1e-6, self.ds.eps), atol=max(1e-8, self.ds.eps / 100),
-                dense_output=False,
-            )
-            if sol.success:
-                yT = sol.y[:, -1]
-                XT = yT[n:].reshape(n, n)
-                # dΦ/dp через вариации + численное дифференцирование BC
-                eps_jac = max(1e-7, self.ds.eps ** 0.5)
-                jac_matrix = np.zeros((m, k))
-                for j in range(k):
-                    p_perturb = p.copy()
-                    p_perturb[j] += eps_jac
-                    Phi_perturb = self._Phi(p_perturb)
-                    jac_matrix[:, j] = (Phi_perturb - Phi_base) / eps_jac
-                return jac_matrix
-        except Exception:
-            pass  # Переходим к fallback
-
-        # --- Попытка 2 (fallback): чистое численное дифференцирование ---
-        return self._dPhi_dp_numerical(p, Phi_base)
-
-    def _dPhi_dp_numerical(self, p: np.ndarray,
-                           Phi_base: Optional[np.ndarray] = None) -> np.ndarray:
-        """
-        Надёжный fallback: dΦ/dp численным дифференцированием.
-        Используется когда вариационное уравнение не сходится.
-        """
-        k = len(self.unknown)
-        if Phi_base is None:
-            Phi_base = self._Phi(p)
-        m = len(Phi_base)
-
-        # Адаптивный шаг
-        eps_jac = max(1e-7, min(1e-4, self.ds.eps ** 0.5))
-        jac_matrix = np.zeros((m, k))
-        for j in range(k):
-            p_perturb = p.copy()
-            h = eps_jac * max(1.0, abs(p[j]))
-            p_perturb[j] += h
-            try:
-                Phi_perturb = self._Phi(p_perturb)
-                jac_matrix[:, j] = (Phi_perturb - Phi_base) / h
-            except Exception:
-                # Односторонняя разность
-                p_perturb2 = p.copy()
-                p_perturb2[j] -= h
-                Phi_perturb2 = self._Phi(p_perturb2)
-                jac_matrix[:, j] = (Phi_base - Phi_perturb2) / h
-        return jac_matrix
-
-    def _numerical_jac_f(self, t: float, x: np.ndarray, h: float = 1e-8) -> np.ndarray:
-        """Численный якобиан ∂f/∂x (fallback если аналитический не доступен)."""
-        n = len(x)
-        J = np.zeros((n, n))
-        f0 = self.parser.f(t, x)
-        for j in range(n):
-            x_perturb = x.copy()
-            x_perturb[j] += h
-            f_perturb = self.parser.f(t, x_perturb)
-            J[:, j] = (f_perturb - f0) / h
-        return J
-
-    # ------------------------------------------------------------------
-    # 3.1 Метод стрельбы (shooting)
-    # ------------------------------------------------------------------
-
-    def solve_shooting(self, callback: Optional[Callable] = None) -> dict:
-        """
-        Классический метод стрельбы: ищем p такое, что Φ(p) = 0.
-        
-        Стратегия:
-          1. Пробуем scipy.optimize.root (hybr) — быстрый, хороший при хорошем guess.
-          2. При неудаче — scipy.optimize.least_squares (LM) — более робастный.
-        """
-        from scipy.optimize import least_squares
-        
-        p0 = np.array(self.ds.guess, dtype=float)
-
-        def residual(p):
-            return self._Phi(p)
-
-        if callback:
-            callback("shooting", 0, "Начало метода стрельбы (hybr)...")
-
-        # Попытка 1: hybr (быстрый)
-        ans = root(residual, p0, method="hybr", tol=self.ds.eps,
-                   options={"maxfev": 100 * len(p0)})
-
-        # Попытка 2: least_squares (LM, более робастный)
-        if not ans.success:
-            if callback:
-                callback("shooting", 0, "hybr не сошёлся, пробуем least_squares...")
-            try:
-                ls_res = least_squares(
-                    residual, p0, ftol=self.ds.eps, xtol=self.ds.eps,
-                    gtol=self.ds.eps, max_nfev=5000 * len(p0)
-                )
-                if ls_res.success or ls_res.cost < self.ds.eps:
-                    ans = type('obj', (object,), {
-                        'success': True, 'x': ls_res.x,
-                        'fun': residual(ls_res.x),
-                        'nfev': ls_res.nfev, 'message': 'least_squares'
-                    })()
-            except Exception:
-                pass
-
-        if not ans.success:
-            raise RuntimeError(f"Метод стрельбы не сошёлся: {ans.message}")
-
-        p_opt = ans.x
-        sol = self._solve_ivp(p_opt, [self.ds.t_star, self.ds.T], dense_output=True)
-
-        if callback:
-            callback("shooting", 100, "Готово!")
-
-        return {
-            "success": True,
-            "p_opt": p_opt,
-            "t": sol.t,
-            "y": sol.y,
-            "sol": sol,
-            "method": "shooting",
-            "iterations": getattr(ans, "nfev", -1),
-            "residual_norm": float(norm(ans.fun)),
-        }
-
-    # ------------------------------------------------------------------
-    # 3.2 Метод продолжения по параметру
-    # ------------------------------------------------------------------
-
-    def solve_continuation(self, callback: Optional[Callable] = None) -> dict:
-        """
-        Метод продолжения по параметру (параметрическая гомотопия).
-
-        Алгоритм (разд. 7.25–7.26):
-          Вспомогательное уравнение:  Φ(p) = (1-μ)·Φ(p₀)  , μ∈[0,1]
-          При μ=0: решение p(0)=p₀  (известно)
-          При μ=1: Φ(p)=0  — исходная задача
-
-        На каждом шаге μ решаем промежуточную задачу Φ(p) = (1-μ)·Φ(p₀)
-        методом Ньютона, стартуя с решения предыдущего шага. Это позволяет
-        устойчиво следовать вдоль выбранной ветви решения.
-        """
-        p0 = np.array(self.ds.guess, dtype=float)
-        N = self.ds.continuation_steps
-
-        # Φ(p₀) — начальная невязка
-        Phi_p0 = self._Phi(p0)
-
-        if callback:
-            callback("continuation", 0,
-                     f"Начало продолжения: ‖Φ(p₀)‖={norm(Phi_p0):.4e}")
-
-        # Проверяем, не случайно p₀ уже решение
-        if norm(Phi_p0) < self.ds.eps:
-            sol = self._solve_ivp(p0, [self.ds.t_star, self.ds.T], dense_output=True)
-            return {
-                "success": True, "p_opt": p0,
-                "t": sol.t, "y": sol.y, "sol": sol,
-                "method": "continuation", "iterations": 0,
-                "residual_norm": float(norm(Phi_p0)),
-            }
-
-        p = p0.copy()
-        dmu = 1.0 / N
-        total_newton = 0
-
-        for step in range(1, N + 1):
-            mu = step / N
-            # Промежуточная цель: Φ(p) = (1-μ)·Φ(p₀)
-            target = (1.0 - mu) * Phi_p0
-
-            # Newton: решаем Φ(p) = target, стартуя с текущего p
-            for newton_iter in range(20):
-                Phi_current = self._Phi(p)
-                residual = Phi_current - target
-                res_norm = norm(residual)
-                if res_norm < self.ds.eps:
-                    break
-
-                try:
-                    dPhi = self._dPhi_dp(p)
-                    delta = np_solve(dPhi, residual)
-                except np.linalg.LinAlgError:
-                    delta = np.linalg.lstsq(dPhi, residual, rcond=None)[0]
-                except Exception:
-                    break
-
-                # Демпфирование
-                p_try = p - delta
-                Phi_try = self._Phi(p_try)
-                if norm(Phi_try - target) < res_norm:
-                    p = p_try
-                else:
-                    for factor in [0.5, 0.25, 0.125, 0.0625]:
-                        p_damp = p - factor * delta
-                        Phi_damp = self._Phi(p_damp)
-                        if norm(Phi_damp - target) < res_norm:
-                            p = p_damp
-                            break
-                    else:
-                        break  # демпфирование не помогло — переходим к след. μ
-
-                total_newton += 1
-
-            # Прогресс
-            if callback and step % max(1, N // 10) == 0:
-                progress = int(100 * step / N)
-                Phi_current = self._Phi(p)
-                callback("continuation", progress,
-                         f"Шаг {step}/{N}: ‖Φ‖={norm(Phi_current):.4e}")
-
-        # Итоговое решение
-        sol = self._solve_ivp(p, [self.ds.t_star, self.ds.T], dense_output=True)
-        Phi_opt = self._Phi(p)
-
-        if callback:
-            callback("continuation", 100,
-                     f"Готово! Newton: {total_newton}, ‖Φ‖={norm(Phi_opt):.4e}")
-
-        return {
-            "success": True,
-            "p_opt": p,
-            "t": sol.t,
-            "y": sol.y,
-            "sol": sol,
-            "method": "continuation",
-            "iterations": total_newton,
-            "residual_norm": float(norm(Phi_opt)),
-        }
-
-    def solve(self, callback: Optional[Callable] = None) -> dict:
-        """Диспетчер: выбирает метод в соответствии с Dataset."""
-        errors = self.ds.validate()
-        if errors:
-            raise ValueError("; ".join(errors))
-
-        if self.ds.solver_method == "shooting":
-            return self.solve_shooting(callback)
-        else:
-            return self.solve_continuation(callback)
-
-
-# ---------------------------------------------------------------------------
-# 4. SolverWorker — вычисления в отдельном потоке
+# 2. SolverWorker — вычисления в отдельном потоке через публичный core API
 # ---------------------------------------------------------------------------
 
 class SolverWorker(QThread):
     """
     Поток для выполнения BVP-решения.
-    Сигналы:
-      progress(str, int, str) — метод, прогресс%, сообщение
-      finished(dict)          — результат
-      error(str)              — ошибка
+    Every signal carries the immutable request ID. Numerical failures retain a
+    BVPResult, while programming failures retain a technical traceback.
     """
-    progress = pyqtSignal(str, int, str)
-    finished = pyqtSignal(dict)
-    error = pyqtSignal(str)
+    request_started = pyqtSignal(str)
+    progress = pyqtSignal(str, str, int, str)
+    request_finished = pyqtSignal(str, object)
+    request_failed = pyqtSignal(str, object)
+    request_cancelled = pyqtSignal(str, object)
 
-    def __init__(self, dataset: Dataset):
+    def __init__(
+        self,
+        request: SolveRequest,
+        cancellation_token: Optional[CancellationToken] = None,
+    ):
         super().__init__()
-        self.dataset = dataset
+        self.request = request
+        self.cancellation_token = cancellation_token or CancellationToken()
+        self.run_context = RunContext.create(
+            request.problem,
+            request.config,
+            request_id=request.request_id,
+            source_task_id=request.source_task_id,
+        )
+
+    def request_cancel(self) -> None:
+        self.cancellation_token.cancel()
+        emit_solver_event(
+            self.run_context,
+            "cancel_requested",
+            phase="cancellation",
+            status="requested",
+        )
 
     def run(self):
+        request_id = self.request.request_id
+        started_perf = time.perf_counter()
+        self.request_started.emit(request_id)
         try:
-            parser = SymPyParser(self.dataset.equations, self.dataset.var_names)
-            parser.lambdify_all()
-            solver = BVPSolver(self.dataset, parser)
-            result = solver.solve(callback=self._on_progress)
-            self.finished.emit(result)
-        except Exception as e:
-            self.error.emit(str(e))
+            self.cancellation_token.raise_if_cancelled()
+            self.cancellation_token.raise_if_cancelled()
+            result = solve_bvp_problem(
+                self.request.problem,
+                self.request.config,
+                cancellation_check=self.cancellation_token.raise_if_cancelled,
+                callback=self._on_progress,
+                run_context=self.run_context,
+            )
+            self.cancellation_token.raise_if_cancelled()
+            if result.success:
+                outcome = SolveOutcome(
+                    request=self.request,
+                    status=SolveOutcomeStatus.COMPLETED,
+                    result=result,
+                    message=result.message,
+                )
+                self.request_finished.emit(request_id, outcome)
+            else:
+                outcome = SolveOutcome(
+                    request=self.request,
+                    status=SolveOutcomeStatus.FAILED,
+                    result=result,
+                    message=result.message,
+                )
+                self.request_failed.emit(request_id, outcome)
+        except SolveCancelled as exc:
+            run_metadata = exc.run_metadata or build_run_metadata(
+                self.run_context,
+                self.request.config,
+                boundary_count=len(self.request.problem.boundary_conditions),
+                final_status="cancelled",
+                elapsed_seconds=time.perf_counter() - started_perf,
+            )
+            if exc.run_metadata is None:
+                emit_solver_event(
+                    self.run_context,
+                    "solve_cancelled",
+                    phase="solve",
+                    status="cancelled",
+                    details={"elapsed_seconds": run_metadata.elapsed_seconds},
+                )
+            outcome = SolveOutcome(
+                request=self.request,
+                status=SolveOutcomeStatus.CANCELLED,
+                message=str(exc),
+                run_metadata=run_metadata,
+            )
+            self.request_cancelled.emit(request_id, outcome)
+        except Exception as exc:
+            technical_diagnostic = traceback.format_exc()
+            run_metadata = getattr(exc, "run_metadata", None) or build_run_metadata(
+                self.run_context,
+                self.request.config,
+                boundary_count=len(self.request.problem.boundary_conditions),
+                final_status="internal_error",
+                elapsed_seconds=time.perf_counter() - started_perf,
+            )
+            LOGGER.debug(
+                "Technical traceback for run %s",
+                self.run_context.run_id,
+                exc_info=True,
+            )
+            outcome = SolveOutcome(
+                request=self.request,
+                status=SolveOutcomeStatus.FAILED,
+                message=f"{type(exc).__name__}: {exc}",
+                technical_diagnostic=technical_diagnostic,
+                run_metadata=run_metadata,
+            )
+            self.request_failed.emit(request_id, outcome)
 
     def _on_progress(self, method: str, percent: int, message: str):
-        self.progress.emit(method, percent, message)
+        self.cancellation_token.raise_if_cancelled()
+        self.progress.emit(self.request.request_id, method, percent, message)
 
 
 # ---------------------------------------------------------------------------
@@ -801,29 +433,67 @@ class IntegratedPlotWidget(QWidget):
         },
     }
 
-    def __init__(self, var_names: List[str], all_results: List[dict],
-                 aux_names: List[str] = None, lang: str = "zh", parent=None):
+    def __init__(
+        self,
+        records: List[SolveRecord],
+        lang: str = "zh",
+        parent=None,
+    ):
         super().__init__(parent)
-        self.var_names = var_names
-        self.all_results = all_results
-        self.aux_names = aux_names or []
+        self._set_records(records)
         self.lang = lang
-        self._visible = set(range(len(all_results)))
+        self._visible = set(range(len(records)))
         self._ls_mode = 0
+        self.plot_diagnostics: tuple[str, ...] = ()
         self.setWindowFlags(Qt.Window)
         self.resize(950, 680)
         self._build_ui()
         self._refresh_plot()
 
-    def update_data(self, var_names: List[str], all_results: List[dict],
-                    aux_names: List[str] = None, lang: str = None):
-        """更新数据(当新求解完成时调用)."""
-        self.var_names = var_names
-        self.all_results = all_results
-        self.aux_names = aux_names or []
+    def _set_records(self, records: List[SolveRecord]) -> None:
+        if not records:
+            raise ValueError("plotting requires at least one SolveRecord")
+        _, rejected = partition_plot_records(records, records[-1])
+        if rejected:
+            reasons = "; ".join(
+                f"{record.request_id}: {reason}" for record, reason in rejected
+            )
+            raise ValueError(f"incompatible SolveRecord plot set: {reasons}")
+        self.records = list(records)
+        self.var_names = list(records[0].request.var_names)
+        self.all_results = [record.to_legacy_dict() for record in records]
+        self.aux_names = sorted(
+            {
+                name
+                for record in records
+                for name in record.auxiliary_outputs
+            }
+        )
+
+    def _solution_label(self, index: int) -> str:
+        record = self.records[index]
+        result = record.result
+        config = record.request.config
+        guess = np.array2string(
+            np.asarray(record.request.problem.initial_guess, dtype=float),
+            precision=4,
+            separator=", ",
+        )
+        tolerance = config.eps if config.eps is not None else config.ivp_rtol
+        return (
+            f"#{index + 1} {record.request.task_name} "
+            f"[{record.request_id[:8]}/{record.request.problem_signature[:8]}] "
+            f"guess={guess} ({result.method}/{config.ivp_method}, "
+            f"tol={tolerance:.1e}, "
+            f"‖Φ‖={result.residual_norm:.2e})"
+        )
+
+    def update_data(self, records: List[SolveRecord], lang: str = None):
+        """Update the plot from provenance-compatible records."""
+        self._set_records(records)
         if lang is not None:
             self.lang = lang
-        self._visible = set(range(len(all_results)))
+        self._visible = set(range(len(records)))
         self._rebuild_controls()
         self._refresh_plot()
 
@@ -914,8 +584,7 @@ class IntegratedPlotWidget(QWidget):
                             (214,39,40),(148,103,189),(140,86,75),
                             (227,119,194),(127,127,127)]
         for i, r in enumerate(self.all_results):
-            name = f"#{i+1} ({r['method']}, ‖Φ‖={r['residual_norm']:.2e})"
-            item = QListWidgetItem(name)
+            item = QListWidgetItem(self._solution_label(i))
             item.setCheckState(Qt.Checked)
             item.setData(Qt.UserRole, i)
             c = self._colors_rgb[i % len(self._colors_rgb)]
@@ -936,6 +605,10 @@ class IntegratedPlotWidget(QWidget):
         right.addWidget(self.canvas)
         self.toolbar = NavigationToolbar(self.canvas, self)
         right.addWidget(self.toolbar)
+        self.diagnostic_label = QLabel("")
+        self.diagnostic_label.setWordWrap(True)
+        self.diagnostic_label.setStyleSheet("color: #c0392b; font-size: 11px;")
+        right.addWidget(self.diagnostic_label)
         main_layout.addLayout(right, 1)
 
     def _populate_y_list(self):
@@ -970,8 +643,7 @@ class IntegratedPlotWidget(QWidget):
 
         self.sol_list.clear()
         for i, r in enumerate(self.all_results):
-            name = f"#{i+1} ({r['method']}, ‖Φ‖={r['residual_norm']:.2e})"
-            item = QListWidgetItem(name)
+            item = QListWidgetItem(self._solution_label(i))
             item.setCheckState(Qt.Checked)
             item.setData(Qt.UserRole, i)
             c = self._colors_rgb[i % len(self._colors_rgb)]
@@ -1032,37 +704,53 @@ class IntegratedPlotWidget(QWidget):
         # 收集数据（状态变量 + 辅助变量）
         aux_set = set(self.aux_names)
         curves = []
-        for i, r in enumerate(self.all_results):
+        diagnostics: list[str] = []
+        for i, record in enumerate(self.records):
             if i not in self._visible:
                 continue
             try:
-                sol = r["sol"]
-                t0, t1 = float(sol.t[0]), float(sol.t[-1])
-                td = np.linspace(t0, t1, 500)
-                if hasattr(sol, 'sol') and callable(sol.sol):
-                    yd = sol.sol(td)
-                else:
-                    yd = np.array([np.interp(td, sol.t, sol.y[j])
-                                   for j in range(len(self.var_names))])
+                td = record.primary_plot_t
+                yd = record.primary_plot_y
                 xd, xl = axis_data(x_axis, td, yd)
                 # 辅助变量数据
-                aux_data = r.get("aux", {})
+                aux_data = record.auxiliary_outputs
                 for y_name in y_axes:
-                    try:
-                        if y_name in aux_set:
-                            # 辅助变量: 从预计算数据中取
-                            aux_vals = aux_data.get(y_name)
-                            if aux_vals is not None:
-                                curves.append((i, y_name, np.asarray(xd), np.asarray(aux_vals)))
+                    if y_name in aux_set:
+                        aux_vals = aux_data.get(y_name)
+                        if aux_vals is None:
+                            diagnostics.append(
+                                f"request {record.request_id}: auxiliary {y_name!r} "
+                                "is unavailable"
+                            )
+                            continue
+                        aux_t = record.auxiliary_sample_t
+                        if x_axis == "t":
+                            aux_x = aux_t
                         else:
-                            yd_arr, yl = axis_data(y_name, td, yd)
-                            curves.append((i, y_name, np.asarray(xd), np.asarray(yd_arr)))
-                    except Exception:
-                        continue
-            except Exception:
-                continue
+                            state_index = self.var_names.index(x_axis)
+                            aux_x = np.interp(aux_t, td, yd[state_index])
+                        curves.append(
+                            (i, y_name, np.asarray(aux_x), np.asarray(aux_vals))
+                        )
+                    else:
+                        yd_arr, yl = axis_data(y_name, td, yd)
+                        curves.append(
+                            (i, y_name, np.asarray(xd), np.asarray(yd_arr))
+                        )
+            except (KeyError, ValueError, TypeError, IndexError, AttributeError) as exc:
+                diagnostics.append(
+                    f"request {record.request_id}: "
+                    f"{type(exc).__name__}: {exc}"
+                )
+
+        self.plot_diagnostics = tuple(diagnostics)
+        self.diagnostic_label.setText("\n".join(diagnostics))
+        for diagnostic in diagnostics:
+            LOGGER.warning("Plot diagnostic: %s", diagnostic)
 
         if not curves:
+            if not diagnostics:
+                self.diagnostic_label.setText("No compatible plot curves are available.")
             return
 
         # 重绘
@@ -1417,7 +1105,8 @@ class BvpSolverApp(QMainWindow):
             "tab_params": "参数与方法",
             "progress_title": "求解进度",
             # 按钮
-            "btn_solve": "求解", "btn_plot": "绘图",
+            "btn_solve": "求解", "btn_cancel": "取消",
+            "btn_plot": "绘图",
             "btn_export": "导出", "btn_clear": "清空",
 
             # 参数标签
@@ -1433,11 +1122,13 @@ class BvpSolverApp(QMainWindow):
             # 状态
             "status_ready": "就绪",
             "status_solving": "正在求解...",
+            "status_cancel_requested": "正在取消...",
+            "status_cancelled": "已取消",
             "status_solved": "求解完成!",
             "status_error": "求解失败",
             "status_saved": "已保存: {name}",
             "err_no_solution": "无可用的解，请先求解。",
-            "confirm_clear": "确定要清空所有数据?",
+            "confirm_clear": "确定要清空结果历史和绘图吗?",
             "solve_success": "求解成功!\n\n方法: {method}\n"
                              "迭代次数: {iter}\n"
                              "残差范数: {res_norm:.4e}\n"
@@ -1504,7 +1195,8 @@ class BvpSolverApp(QMainWindow):
             "tab_params": "Параметры и метод",
             "progress_title": "Progress",
             # Кнопки
-            "btn_solve": "Решить", "btn_plot": "График",
+            "btn_solve": "Решить", "btn_cancel": "Отмена",
+            "btn_plot": "График",
             "btn_export": "Экспорт", "btn_clear": "Очистить",
 
             "param_T": "Время T:",
@@ -1517,11 +1209,13 @@ class BvpSolverApp(QMainWindow):
             "solver_shoot": "Стрельба / Shooting",
             "status_ready": "Готово",
             "status_solving": "Решаю...",
+            "status_cancel_requested": "Отмена запрошена...",
+            "status_cancelled": "Отменено",
             "status_solved": "Решение найдено!",
             "status_error": "Ошибка",
             "status_saved": "Сохранено: {name}",
             "err_no_solution": "Нет решения. Сначала нажмите 'Решить'.",
-            "confirm_clear": "Очистить все данные?",
+            "confirm_clear": "Очистить историю результатов и график?",
             "solve_success": "Решение найдено!\n\nМетод: {method}\n"
                              "Итераций: {iter}\n"
                              "‖Φ‖: {res_norm:.4e}\n"
@@ -1541,13 +1235,26 @@ class BvpSolverApp(QMainWindow):
 
         # ---- Библиотека задач -------------------------------------------
         self.tasks: List[Dataset] = []          # все задачи
+        self._task_ids: List[str] = []          # stable GUI identities
         self.current_task_idx: int = -1          # текущая выбранная
         self._suppress_sync: bool = False       # флаг блокировки синхронизации
 
-        # Хранение результатов
-        self.last_result: Optional[dict] = None
-        self.all_results: List[dict] = []
-        self._task_status: Dict[int, str] = {}  # task_idx -> "solved" | "error"
+        # Request lifecycle and provenance-backed result history.
+        self.solve_records: List[SolveRecord] = []
+        self.last_record: Optional[SolveRecord] = None
+        self.last_failed_record: Optional[SolveOutcome] = None
+        self.last_cancelled_outcome: Optional[SolveOutcome] = None
+        self.solve_state = GuiSolveState.IDLE
+        self.active_request_id: Optional[str] = None
+        self.active_worker: Optional[SolverWorker] = None
+        self.active_cancellation_token: Optional[CancellationToken] = None
+        self._processed_request_ids: set[str] = set()
+        self._run_contexts: Dict[str, RunContext] = {}
+        self._last_signal_diagnostic = ""
+        self._closing = False
+        self.close_wait_timeout_ms = 2000
+        self.worker_factory = SolverWorker
+        self._task_status: Dict[str, str] = {}
 
         self.init_ui()
         # Загружаем встроенные примеры как задачи
@@ -1555,10 +1262,46 @@ class BvpSolverApp(QMainWindow):
         self._refresh_task_table()
         self.update_language(self.current_lang)
         self.apply_theme()
+        self._render_gui_state()
+
+    @property
+    def all_results(self) -> List[dict]:
+        """Legacy boundary view; SolveRecord remains the history source of truth."""
+        return [record.to_legacy_dict() for record in self.solve_records]
+
+    @property
+    def last_result(self) -> Optional[dict]:
+        return None if self.last_record is None else self.last_record.to_legacy_dict()
+
+    @property
+    def last_failed_result(self) -> Optional[dict]:
+        outcome = self.last_failed_record
+        if outcome is None or outcome.result is None:
+            return None
+        return outcome.result.to_dict()
 
     def _load_builtin_tasks(self):
         """Built-in examples removed. User imports via Load button."""
         pass
+
+    def _ensure_task_ids(self) -> None:
+        while len(self._task_ids) < len(self.tasks):
+            self._task_ids.append(uuid4().hex)
+        if len(self._task_ids) > len(self.tasks):
+            del self._task_ids[len(self.tasks):]
+
+    def _task_id_for_index(self, index: int) -> Optional[str]:
+        self._ensure_task_ids()
+        if 0 <= index < len(self._task_ids):
+            return self._task_ids[index]
+        return None
+
+    def _task_index_for_id(self, task_id: str) -> Optional[int]:
+        self._ensure_task_ids()
+        try:
+            return self._task_ids.index(task_id)
+        except ValueError:
+            return None
 
     # ------------------------------------------------------------------
     # Управление библиотекой задач
@@ -1566,6 +1309,7 @@ class BvpSolverApp(QMainWindow):
 
     def _refresh_task_table(self):
         """Обновляет таблицу задач."""
+        self._ensure_task_ids()
         self.task_table.setRowCount(len(self.tasks))
         for i, ds in enumerate(self.tasks):
             # Номер
@@ -1577,11 +1321,13 @@ class BvpSolverApp(QMainWindow):
             item_name.setFlags(item_name.flags() & ~Qt.ItemIsEditable)
             self.task_table.setItem(i, 1, item_name)
             # Статус
-            st = self._task_status.get(i, "")
+            st = self._task_status.get(self._task_ids[i], "")
             if st == "solved":
                 status_text = "✓"
             elif st == "error":
                 status_text = "✗"
+            elif st == "cancelled":
+                status_text = "–"
             else:
                 status_text = ""
             item_status = QTableWidgetItem(status_text)
@@ -1592,6 +1338,9 @@ class BvpSolverApp(QMainWindow):
             elif st == "error":
                 item_status.setBackground(QColor(231, 76, 60, 60))
                 item_status.setForeground(QColor(231, 76, 60))
+            elif st == "cancelled":
+                item_status.setBackground(QColor(127, 140, 141, 50))
+                item_status.setForeground(QColor(127, 140, 141))
             self.task_table.setItem(i, 2, item_status)
 
     def _on_task_selected(self):
@@ -1650,7 +1399,7 @@ class BvpSolverApp(QMainWindow):
 
             # --- Параметры ---
             self.input_T.setValue(ds.T)
-            self.input_eps.setValue(ds.eps)
+            self.input_eps.setValue(1e-8 if ds.eps is None else ds.eps)
             self.combo_method.setCurrentText(ds.method)
             # solver_method
             idx = self.combo_solver.findData(ds.solver_method)
@@ -1691,13 +1440,11 @@ class BvpSolverApp(QMainWindow):
                     raw_guess.append(float(s_clean))
                 except ValueError:
                     try:
-                        expr = parse_expr(s_clean, global_dict={
-                            "pi": sp.pi, "e": sp.E,
-                            "sin": sp.sin, "cos": sp.cos, "sqrt": sp.sqrt,
-                            "Integer": sp.Integer, "Float": sp.Float,
-                        }, transformations=standard_transformations, evaluate=True)
+                        expr = SymPyParser.parse_scalar(s_clean)
                         raw_guess.append(float(expr.evalf()))
-                    except Exception:
+                    except ExpressionValidationError:
+                        raise
+                    except (TypeError, ValueError, OverflowError):
                         pass
         n_dim = len(eqs)
         # Если guess длины n — полный вектор, извлекаем unknown
@@ -1716,7 +1463,11 @@ class BvpSolverApp(QMainWindow):
         ds.initial_values = iv
         ds.boundary_conditions = bcs
         ds.guess = guess
-        ds.eps = self.input_eps.value()
+        # The basic control edits legacy datasets.  An explicit JSON/API task keeps
+        # eps=None so an incomplete explicit configuration cannot be silently
+        # converted into a valid-looking legacy request.
+        if ds.eps is not None:
+            ds.eps = self.input_eps.value()
         ds.method = self.combo_method.currentText()
         ds.solver_method = self.combo_solver.currentData()
         ds.continuation_steps = self.input_steps.value()
@@ -1744,6 +1495,7 @@ class BvpSolverApp(QMainWindow):
             unknown_indices=[0, 1],
         )
         self.tasks.append(ds)
+        self._task_ids.append(uuid4().hex)
         self._refresh_task_table()
         # Выбираем новую задачу
         self.task_table.selectRow(len(self.tasks) - 1)
@@ -1757,7 +1509,11 @@ class BvpSolverApp(QMainWindow):
             QMessageBox.Yes | QMessageBox.No
         )
         if reply == QMessageBox.Yes:
+            task_id = self._task_id_for_index(self.current_task_idx)
             self.tasks.pop(self.current_task_idx)
+            self._task_ids.pop(self.current_task_idx)
+            if task_id is not None:
+                self._task_status.pop(task_id, None)
             self.current_task_idx = -1
             self._refresh_task_table()
             self.input_task_name.setText("")
@@ -1786,8 +1542,10 @@ class BvpSolverApp(QMainWindow):
             if isinstance(data, list):
                 for item in data:
                     self.tasks.append(Dataset.from_dict(item))
+                    self._task_ids.append(uuid4().hex)
             elif isinstance(data, dict):
                 self.tasks.append(Dataset.from_dict(data))
+                self._task_ids.append(uuid4().hex)
             self._refresh_task_table()
             self.progress_detail.setText(f"已加载 {len(self.tasks)} 个任务")
         except Exception as e:
@@ -1802,8 +1560,7 @@ class BvpSolverApp(QMainWindow):
             return
         try:
             data = [ds.to_dict() for ds in self.tasks]
-            with open(path, "w", encoding="utf-8") as f:
-                json.dump(data, f, indent=2, ensure_ascii=False)
+            write_json_data_atomic(path, data)
             self.progress_detail.setText(f"已保存 {len(data)} 个任务")
         except Exception as e:
             QMessageBox.critical(self, "Ошибка сохранения", str(e))
@@ -1970,6 +1727,9 @@ class BvpSolverApp(QMainWindow):
         self.btn_solve = QPushButton()
         self.btn_solve.setMinimumWidth(100)
         self.btn_solve.clicked.connect(self.on_solve)
+        self.btn_cancel = QPushButton()
+        self.btn_cancel.setMinimumWidth(100)
+        self.btn_cancel.clicked.connect(self.on_cancel)
         self.btn_plot = QPushButton()
         self.btn_plot.setMinimumWidth(100)
         self.btn_plot.clicked.connect(self.on_plot)
@@ -1980,6 +1740,7 @@ class BvpSolverApp(QMainWindow):
         self.btn_clear.setMinimumWidth(100)
         self.btn_clear.clicked.connect(self.on_clear)
         btn_layout.addWidget(self.btn_solve)
+        btn_layout.addWidget(self.btn_cancel)
         btn_layout.addWidget(self.btn_plot)
         btn_layout.addWidget(self.btn_export)
         btn_layout.addWidget(self.btn_clear)
@@ -2135,168 +1896,591 @@ class BvpSolverApp(QMainWindow):
     # Решение
     # ------------------------------------------------------------------
 
-    def on_solve(self):
+    def _set_gui_state(
+        self, state: GuiSolveState, detail: Optional[str] = None
+    ) -> None:
+        if not gui_transition_allowed(self.solve_state, state):
+            raise RuntimeError(
+                f"Invalid GUI solve transition: {self.solve_state.value} -> "
+                f"{state.value}"
+            )
+        self.solve_state = state
+        if detail is not None:
+            self.progress_detail.setText(detail)
+        self._render_gui_state()
+
+    def _render_gui_state(self) -> None:
+        if not hasattr(self, "btn_solve"):
+            return
         t = self.TRANSLATIONS[self.current_lang]
-        self.btn_solve.setEnabled(False)
-        # 重置进度标签样式（清除之前的绿色）
-        self.progress_bar_label.setStyleSheet("")
-        self.progress_bar_label.setText(t["status_solving"])
+        active = self.solve_state in {
+            GuiSolveState.RUNNING,
+            GuiSolveState.CANCEL_REQUESTED,
+        }
+        self.btn_solve.setEnabled(not active)
+        self.btn_cancel.setEnabled(self.solve_state is GuiSolveState.RUNNING)
+        self.btn_plot.setEnabled(bool(self.solve_records))
+        self.btn_export.setEnabled(self.last_record is not None)
+        self.btn_clear.setEnabled(
+            bool(
+                self.solve_records
+                or self.last_failed_record
+                or self.last_cancelled_outcome
+            )
+        )
+
+        # Task viewing and editing remain available because active requests are
+        # immutable snapshots. Their availability is still centralized here.
+        for widget in (
+            self.btn_task_add,
+            self.btn_task_delete,
+            self.btn_task_load,
+            self.btn_task_save,
+            self.btn_task_save_current,
+            self.task_table,
+            self.eq_editor,
+        ):
+            widget.setEnabled(True)
+
+        status_key = {
+            GuiSolveState.IDLE: "status_ready",
+            GuiSolveState.RUNNING: "status_solving",
+            GuiSolveState.CANCEL_REQUESTED: "status_cancel_requested",
+            GuiSolveState.COMPLETED: "status_solved",
+            GuiSolveState.FAILED: "status_error",
+            GuiSolveState.CANCELLED: "status_cancelled",
+        }[self.solve_state]
+        self.progress_bar_label.setText(t[status_key])
+        if self.solve_state is GuiSolveState.COMPLETED:
+            style = "background-color: #27ae60; color: white;"
+        elif self.solve_state is GuiSolveState.FAILED:
+            style = "background-color: #e74c3c; color: white;"
+        elif self.solve_state is GuiSolveState.CANCEL_REQUESTED:
+            style = "background-color: #f39c12; color: white;"
+        elif self.solve_state is GuiSolveState.CANCELLED:
+            style = "background-color: #7f8c8d; color: white;"
+        else:
+            style = ""
+        if style:
+            style += " padding: 4px 8px; border-radius: 4px; font-weight: bold;"
+        self.progress_bar_label.setStyleSheet(style)
+
+    def _build_solve_request(self) -> SolveRequest:
+        dataset = self._build_dataset()
+        errors = dataset.validate()
+        if errors:
+            raise ValueError("\n".join(errors))
+        problem = problem_from_dataset(dataset)
+        config = config_from_dataset(dataset)
+        source_index = (
+            self.current_task_idx
+            if 0 <= self.current_task_idx < len(self.tasks)
+            else None
+        )
+        source_task_id = (
+            self._task_id_for_index(source_index)
+            if source_index is not None
+            else f"unsaved-{uuid4().hex}"
+        )
+        return SolveRequest.create(
+            problem=problem,
+            config=config,
+            source_task_id=source_task_id,
+            source_task_index=source_index,
+            display_metadata={"language": self.current_lang},
+        )
+
+    def on_solve(self) -> bool:
+        if self.solve_state in {
+            GuiSolveState.RUNNING,
+            GuiSolveState.CANCEL_REQUESTED,
+        } or (self.active_worker is not None and self.active_worker.isRunning()):
+            self._last_signal_diagnostic = (
+                "A solve request is already active; a second worker was not started."
+            )
+            self.progress_detail.setText(self._last_signal_diagnostic)
+            LOGGER.info(self._last_signal_diagnostic)
+            return False
 
         try:
-            dataset = self._build_dataset()
-            errors = dataset.validate()
-            if errors:
-                QMessageBox.warning(self, "Validation Error", "\n".join(errors))
-                self.btn_solve.setEnabled(True)
-                self.progress_bar_label.setText(t["status_ready"])
-                return
-        except Exception as e:
-            QMessageBox.critical(self, "Error", str(e))
-            self.btn_solve.setEnabled(True)
+            request = self._build_solve_request()
+        except Exception as exc:
+            QMessageBox.warning(self, "Validation Error", str(exc))
+            self.progress_detail.setText(str(exc))
+            self._render_gui_state()
+            return False
+        return self._start_solve_request(request)
+
+    def _start_solve_request(self, request: SolveRequest) -> bool:
+        if self.active_worker is not None and self.active_worker.isRunning():
+            return False
+        token = CancellationToken()
+        worker = self.worker_factory(request, token)
+        worker.request_started.connect(self._on_request_started)
+        worker.progress.connect(self._on_progress)
+        worker.request_finished.connect(self._on_solve_done)
+        worker.request_failed.connect(self._on_solve_error)
+        worker.request_cancelled.connect(self._on_solve_cancelled)
+        worker.finished.connect(
+            lambda request_id=request.request_id, target=worker:
+            self._on_worker_thread_finished(request_id, target)
+        )
+        self.active_request_id = request.request_id
+        self.active_cancellation_token = token
+        self.active_worker = worker
+        context = getattr(worker, "run_context", None)
+        if isinstance(context, RunContext):
+            self._run_contexts[request.request_id] = context
+        self._set_gui_state(
+            GuiSolveState.RUNNING,
+            f"request_id={request.request_id} task={request.task_name}",
+        )
+        LOGGER.info("Solve request %s started for %s", request.request_id, request.task_name)
+        worker.start()
+        return True
+
+    def on_cancel(self) -> bool:
+        if (
+            self.solve_state is not GuiSolveState.RUNNING
+            or self.active_request_id is None
+            or self.active_cancellation_token is None
+        ):
+            return False
+        request_id = self.active_request_id
+        if self.active_worker is not None and hasattr(
+            self.active_worker, "request_cancel"
+        ):
+            self.active_worker.request_cancel()
+        else:
+            self.active_cancellation_token.cancel()
+            context = self._run_contexts.get(request_id)
+            if context is not None:
+                emit_solver_event(
+                    context,
+                    "cancel_requested",
+                    phase="cancellation",
+                    status="requested",
+                )
+        self._set_gui_state(
+            GuiSolveState.CANCEL_REQUESTED,
+            f"Cancellation requested for {request_id}; waiting for a checkpoint.",
+        )
+        LOGGER.info("Cancellation requested for solve %s", request_id)
+        return True
+
+    def _on_request_started(self, request_id: str) -> None:
+        LOGGER.info("Worker acknowledged solve request %s", request_id)
+
+    def _on_progress(
+        self, request_id: str, method: str, percent: int, message: str
+    ) -> None:
+        if request_id != self.active_request_id or self._closing:
+            context = self._run_contexts.get(request_id)
+            if context is not None:
+                emit_solver_event(
+                    context,
+                    "stale_signal_ignored",
+                    phase="gui",
+                    status="ignored",
+                    details={"signal": "progress"},
+                    level=logging.WARNING,
+                )
+            LOGGER.info("Ignored stale progress signal for request %s", request_id)
             return
-
-        self.worker = SolverWorker(dataset)
-        self.worker.progress.connect(self._on_progress)
-        self.worker.finished.connect(self._on_solve_done)
-        self.worker.error.connect(self._on_solve_error)
-        self.worker.start()
-
-    def _on_progress(self, method: str, percent: int, message: str):
         self.progress_bar_label.setText(f"[{percent}%] {method}")
         self.progress_detail.setText(message)
 
-    def _on_solve_done(self, result: dict):
-        t = self.TRANSLATIONS[self.current_lang]
-        self.btn_solve.setEnabled(True)
-        self.last_result = result
+    def _accept_terminal_signal(self, request_id: str) -> bool:
+        if request_id in self._processed_request_ids:
+            self._last_signal_diagnostic = (
+                f"Ignored duplicate terminal signal for request {request_id}."
+            )
+            LOGGER.warning(self._last_signal_diagnostic)
+            context = self._run_contexts.get(request_id)
+            if context is not None:
+                emit_solver_event(
+                    context,
+                    "duplicate_signal_ignored",
+                    phase="gui",
+                    status="ignored",
+                    details={"signal": "terminal"},
+                    level=logging.WARNING,
+                )
+            return False
+        if request_id != self.active_request_id:
+            self._processed_request_ids.add(request_id)
+            self._last_signal_diagnostic = (
+                f"Ignored stale terminal signal for request {request_id}; "
+                f"active_request_id={self.active_request_id}."
+            )
+            LOGGER.warning(self._last_signal_diagnostic)
+            context = self._run_contexts.get(request_id)
+            if context is not None:
+                emit_solver_event(
+                    context,
+                    "stale_signal_ignored",
+                    phase="gui",
+                    status="ignored",
+                    details={"signal": "terminal"},
+                    level=logging.WARNING,
+                )
+            return False
+        self._processed_request_ids.add(request_id)
+        return True
 
-        # --- 计算辅助输出变量 ---
-        result = self._compute_aux_outputs(result)
+    def _release_active_request(self, request_id: str) -> None:
+        if self.active_request_id == request_id:
+            self.active_request_id = None
+            self.active_cancellation_token = None
 
-        self.all_results.append(result)
+    def _set_request_task_status(self, request: SolveRequest, status: str) -> None:
+        if self._task_index_for_id(request.source_task_id) is None:
+            return
+        self._task_status[request.source_task_id] = status
+        self._refresh_task_table()
 
-        # --- 构建完整的 x(0) 状态向量 ---
-        full_state = self._build_full_state(result["p_opt"])
-        full_str = np.array2string(full_state, precision=6, separator=", ")
+    def _on_solve_done(self, request_id: str, outcome: SolveOutcome) -> None:
+        if self._closing or not self._accept_terminal_signal(request_id):
+            return
+        if (
+            outcome.request_id != request_id
+            or outcome.status is not SolveOutcomeStatus.COMPLETED
+            or outcome.result is None
+        ):
+            raise RuntimeError("Worker emitted an invalid completed outcome")
 
-        p_opt_str = np.array2string(
-            result["p_opt"], precision=6, separator=", "
+        if (
+            self.active_cancellation_token is not None
+            and self.active_cancellation_token.is_cancelled()
+        ):
+            result_metadata = outcome.result.run_metadata
+            cancelled_metadata = (
+                build_run_metadata(
+                    metadata_context(result_metadata),
+                    outcome.request.config,
+                    boundary_count=len(outcome.request.problem.boundary_conditions),
+                    final_status="cancelled",
+                    elapsed_seconds=result_metadata.elapsed_seconds,
+                    solver_metadata=outcome.result.solver_metadata,
+                    result_data=outcome.result.to_dict(),
+                )
+                if result_metadata is not None
+                else outcome.run_metadata
+            )
+            cancelled = SolveOutcome(
+                request=outcome.request,
+                status=SolveOutcomeStatus.CANCELLED,
+                message="Cancellation was observed before auxiliary output processing.",
+                run_metadata=cancelled_metadata,
+            )
+            context = self._run_contexts.get(request_id)
+            if context is not None:
+                emit_solver_event(
+                    context,
+                    "solve_cancelled",
+                    phase="solve",
+                    status="cancelled",
+                    details={"checkpoint": "before_auxiliary_outputs"},
+                )
+            self.last_cancelled_outcome = cancelled
+            self._set_request_task_status(outcome.request, "cancelled")
+            self._release_active_request(request_id)
+            self._set_gui_state(
+                GuiSolveState.CANCELLED,
+                f"request_id={request_id}: {cancelled.message}",
+            )
+            return
+
+        aux_data, aux_t, aux_errors = self._compute_aux_outputs(
+            outcome.request, outcome.result
         )
-        msg = t["solve_success"].format(
-            method=result["method"],
-            iter=result["iterations"],
-            res_norm=result["residual_norm"],
+        record = SolveRecord(
+            request=outcome.request,
+            result=outcome.result,
+            auxiliary_outputs=aux_data,
+            auxiliary_sample_t=aux_t,
+            auxiliary_errors=aux_errors,
+            completed_at=outcome.completed_at,
+        )
+        self.solve_records.append(record)
+        self.last_record = record
+        self._set_request_task_status(outcome.request, "solved")
+        self._release_active_request(request_id)
+
+        result = outcome.result
+        full_state = outcome.request.build_initial_state(result.p_opt)
+        full_str = np.array2string(full_state, precision=6, separator=", ")
+        p_opt_str = np.array2string(result.p_opt, precision=6, separator=", ")
+        message = self.TRANSLATIONS[self.current_lang]["solve_success"].format(
+            method=result.method,
+            iter=result.iterations,
+            res_norm=result.residual_norm,
             p_opt=p_opt_str,
             full_state=full_str,
         )
-        # 求解成功 — 进度标签变绿色，表格状态列标记 ✓
-        self.progress_bar_label.setStyleSheet(
-            "background-color: #27ae60; color: white; "
-            "padding: 4px 8px; border-radius: 4px; font-weight: bold;"
+        mode = result.solver_metadata.get("tolerance_mode", "unknown")
+        run_id_short = (
+            result.run_metadata.run_id[:8] if result.run_metadata else "unknown"
         )
-        self.progress_bar_label.setText(t["status_solved"])
-        self.progress_detail.setText(
-            f"‖Φ‖ = {result['residual_norm']:.4e}"
+        elapsed_seconds = (
+            result.run_metadata.elapsed_seconds if result.run_metadata else 0.0
         )
-        if self.current_task_idx >= 0:
-            self._task_status[self.current_task_idx] = "solved"
-            self._refresh_task_table()
-        QMessageBox.information(self, "Result", msg)
+        detail = (
+            f"run_id={run_id_short}; "
+            f"request_id={request_id[:8]}; problem={outcome.request.task_name}; "
+            f"method={result.method}; status={result.status}; "
+            f"‖Φ‖ = {result.residual_norm:.4e}; "
+            f"max_scaled_ratio={result.boundary_max_scaled_ratio:.4e}; "
+            f"tolerance_mode={mode}; elapsed_seconds={elapsed_seconds:.6f}"
+        )
+        if aux_errors:
+            detail += "; auxiliary warnings: " + " | ".join(aux_errors)
+        self._set_gui_state(GuiSolveState.COMPLETED, detail)
+        LOGGER.info("Solve request %s completed", request_id)
+        QMessageBox.information(self, "Result", message)
 
-    def _build_full_state(self, p_opt: np.ndarray) -> np.ndarray:
-        """从 p_opt 和 known 值构建完整的 x(0) 状态向量."""
-        if self.current_task_idx < 0 or self.current_task_idx >= len(self.tasks):
-            return p_opt
-        ds = self.tasks[self.current_task_idx]
-        n = ds.dim()
-        state = np.zeros(n)
-        # 填入 known 值
-        for idx in ds.known_indices:
-            val = ds.initial_values.get(idx)
-            if val is not None:
-                state[idx] = float(val)
-        # 填入 unknown 值 (p_opt)
-        for i, idx in enumerate(ds.unknown_indices):
-            if i < len(p_opt):
-                state[idx] = p_opt[i]
-        return state
+    def _on_solve_error(self, request_id: str, outcome: SolveOutcome) -> None:
+        if self._closing or not self._accept_terminal_signal(request_id):
+            return
+        if outcome.request_id != request_id or outcome.status is not SolveOutcomeStatus.FAILED:
+            raise RuntimeError("Worker emitted an invalid failed outcome")
+        self.last_failed_record = outcome
+        self._set_request_task_status(outcome.request, "error")
+        self._release_active_request(request_id)
+        if outcome.result is not None:
+            diagnostic = self._format_failed_result(outcome.result)
+            QMessageBox.warning(self, "BVP result rejected", diagnostic)
+        else:
+            diagnostic = outcome.message
+            QMessageBox.critical(self, "Solve error", diagnostic)
+        if outcome.technical_diagnostic:
+            LOGGER.debug(
+                "Technical diagnostic for request %s:\n%s",
+                request_id,
+                outcome.technical_diagnostic,
+            )
+        self._set_gui_state(GuiSolveState.FAILED, diagnostic)
 
-    def _compute_aux_outputs(self, result: dict) -> dict:
-        """计算辅助输出变量并存储在结果中.
-        
-        对于 26.4 (lunula): u1/u2 从 ODE 方程反推,
-        自动跟随方程中的 mu 值(用户可能修改了 mu).
-        dx0/dt = T*(x1+u1) -> u1 = dx0/dt/T - x1
-        dx1/dt = T*(-1.5*x0-0.25*x1+u2) -> u2 = dx1/dt/T + 1.5*x0 + 0.25*x1
+    def _on_solve_cancelled(self, request_id: str, outcome: SolveOutcome) -> None:
+        if self._closing or not self._accept_terminal_signal(request_id):
+            return
+        if outcome.request_id != request_id or outcome.status is not SolveOutcomeStatus.CANCELLED:
+            raise RuntimeError("Worker emitted an invalid cancelled outcome")
+        self.last_cancelled_outcome = outcome
+        self._set_request_task_status(outcome.request, "cancelled")
+        self._release_active_request(request_id)
+        self._set_gui_state(
+            GuiSolveState.CANCELLED,
+            f"run_id={outcome.run_id[:8] if outcome.run_id else 'unknown'}; "
+            f"request_id={request_id[:8]}; status=cancelled; {outcome.message}",
+        )
+        LOGGER.info("Solve request %s cancelled", request_id)
+
+    def _on_worker_thread_finished(
+        self, request_id: str, worker: SolverWorker
+    ) -> None:
+        LOGGER.info("Worker thread finished for request %s", request_id)
+        if self.active_worker is worker:
+            self.active_worker = None
+
+    @staticmethod
+    def _format_failed_result(result: BVPResult | dict) -> str:
+        if isinstance(result, BVPResult):
+            result = result.to_dict()
+        residual = np.asarray(result.get("boundary_residual", []), dtype=float)
+        residual_text = np.array2string(residual, precision=6, separator=", ")
+        residual_norm = result.get("boundary_residual_norm", float("inf"))
+        boundary_atol = result.get("boundary_atol", "unknown")
+        boundary_rtol = result.get("boundary_rtol", "unknown")
+        thresholds = np.asarray(result.get("boundary_thresholds", []), dtype=float)
+        component_success = np.asarray(
+            result.get("boundary_component_success", []), dtype=bool
+        )
+        failed_components = np.flatnonzero(~component_success).tolist()
+        maximum_ratio = result.get("boundary_max_scaled_ratio", float("inf"))
+        metadata = result.get("solver_metadata", {})
+        run_metadata = result.get("run_metadata") or {}
+        diagnostic_keys = (
+            "tolerance_mode",
+            "legacy_eps",
+            "effective_ivp_rtol",
+            "effective_ivp_atol",
+            "effective_root_tol",
+            "effective_least_squares_ftol",
+            "effective_least_squares_xtol",
+            "effective_least_squares_gtol",
+            "effective_continuation_residual_tol",
+            "optimizer",
+            "fallback_used",
+            "root",
+            "least_squares",
+            "failure_step",
+            "failure_reason",
+        )
+        metadata_summary = {
+            key: metadata[key] for key in diagnostic_keys if key in metadata
+        }
+        return (
+            f"method: {result.get('method', 'unknown')}\n"
+            f"run_id: {run_metadata.get('run_id', 'unknown')}\n"
+            f"request_id: {run_metadata.get('request_id', 'unknown')}\n"
+            f"elapsed_seconds: {run_metadata.get('elapsed_seconds', 'unknown')}\n"
+            f"status: {result.get('status', 'unknown')}\n"
+            f"message: {result.get('message', 'No diagnostic message')}\n"
+            f"optimizer_success: {result.get('optimizer_success', False)}\n"
+            f"ivp_success: {result.get('ivp_success', False)}\n"
+            f"finite_success: {result.get('finite_success', False)}\n"
+            f"boundary_success: {result.get('boundary_success', False)}\n"
+            f"boundary_residual: {residual_text}\n"
+            f"boundary_residual_norm: {residual_norm}\n"
+            f"boundary_atol: {boundary_atol}\n"
+            f"boundary_rtol: {boundary_rtol}\n"
+            f"boundary_thresholds: {thresholds.tolist()}\n"
+            f"boundary_max_scaled_ratio: {maximum_ratio}\n"
+            f"failed_boundary_components: {failed_components}\n"
+            f"solver_metadata: {metadata_summary}"
+        )
+
+    @staticmethod
+    def _build_full_state(
+        request: SolveRequest, p_opt: np.ndarray
+    ) -> np.ndarray:
+        """Build x(t_start) exclusively from the originating request."""
+        return request.build_initial_state(p_opt)
+
+    def _compute_aux_outputs(
+        self, request: SolveRequest, result: BVPResult
+    ) -> tuple[dict[str, np.ndarray], np.ndarray, tuple[str, ...]]:
+        """Compute auxiliary outputs exclusively from the request snapshot.
+
+        Each expression failure is retained as a diagnostic. A valid primary
+        solution is never discarded because one auxiliary expression failed.
         """
-        if self.current_task_idx < 0 or self.current_task_idx >= len(self.tasks):
-            return result
-        ds = self.tasks[self.current_task_idx]
+        problem = request.problem
+        has_lunula_outputs = (
+            "26.4" in problem.name or "Лунка" in problem.name
+        ) and len(problem.var_names) >= 5
+        if not problem.auxiliary_expressions and not has_lunula_outputs:
+            return {}, np.array([], dtype=float), ()
+
+        errors: list[str] = []
         try:
-            parser = SymPyParser(ds.equations, ds.var_names)
+            parser = SymPyParser(list(problem.odes), list(problem.var_names))
             parser.parse()
             parser.lambdify_all()
-
-            sol = result["sol"]
+            sol = result.sol
+            if sol is None:
+                raise ValueError("dense IVP solution is unavailable")
             t0, t1 = float(sol.t[0]), float(sol.t[-1])
             td = np.linspace(t0, t1, 500)
-            if hasattr(sol, 'sol') and callable(sol.sol):
+            if hasattr(sol, "sol") and callable(sol.sol):
                 yd = sol.sol(td)
             else:
-                yd = np.array([np.interp(td, sol.t, sol.y[j])
-                               for j in range(len(ds.var_names))])
+                yd = np.array(
+                    [
+                        np.interp(td, sol.t, sol.y[j])
+                        for j in range(len(problem.var_names))
+                    ]
+                )
+        except Exception as exc:
+            diagnostic = (
+                "auxiliary setup failed for request "
+                f"{request.request_id}: {type(exc).__name__}: {exc}"
+            )
+            LOGGER.warning(diagnostic)
+            context = self._run_contexts.get(request.request_id)
+            if context is not None:
+                emit_solver_event(
+                    context,
+                    "auxiliary_output_failed",
+                    phase="auxiliary",
+                    status="failed",
+                    details={
+                        "name": None,
+                        "error_type": type(exc).__name__,
+                        "reason": str(exc),
+                    },
+                    level=logging.WARNING,
+                )
+            return {}, np.array([], dtype=float), (diagnostic,)
 
-            aux_data = {}
-            aux_names = []
-
-            # --- 26.4 lunula: 从 ODE 反推 u1, u2 ---
-            is_lunula = ("26.4" in ds.name or "Лунка" in ds.name)
-            if is_lunula and len(ds.var_names) >= 5:
-                u1_vals = []
-                u2_vals = []
-                for i, t in enumerate(td):
-                    f_vals = parser.f(t, yd[:, i])
-                    T = yd[4, i]  # x4 = T
-                    if abs(T) > 1e-12:
-                        u1 = f_vals[0] / T - yd[1, i]
-                        u2 = f_vals[1] / T + 1.5 * yd[0, i] + 0.25 * yd[1, i]
+        aux_data: dict[str, np.ndarray] = {}
+        if has_lunula_outputs:
+            try:
+                u1_values = []
+                u2_values = []
+                for index, time_value in enumerate(td):
+                    f_values = parser.f(time_value, yd[:, index])
+                    time_scale = yd[4, index]
+                    if abs(time_scale) > 1e-12:
+                        u1 = f_values[0] / time_scale - yd[1, index]
+                        u2 = (
+                            f_values[1] / time_scale
+                            + 1.5 * yd[0, index]
+                            + 0.25 * yd[1, index]
+                        )
                     else:
                         u1 = u2 = 0.0
-                    u1_vals.append(u1)
-                    u2_vals.append(u2)
-                aux_data["u1"] = np.array(u1_vals)
-                aux_data["u2"] = np.array(u2_vals)
-                aux_names.extend(["u1", "u2"])
+                    u1_values.append(u1)
+                    u2_values.append(u2)
+                aux_data["u1"] = np.asarray(u1_values, dtype=float)
+                aux_data["u2"] = np.asarray(u2_values, dtype=float)
+            except Exception as exc:
+                diagnostic = f"auxiliary 'u1/u2' failed: {type(exc).__name__}: {exc}"
+                errors.append(diagnostic)
+                LOGGER.warning("Request %s: %s", request.request_id, diagnostic)
+                context = self._run_contexts.get(request.request_id)
+                if context is not None:
+                    emit_solver_event(
+                        context,
+                        "auxiliary_output_failed",
+                        phase="auxiliary",
+                        status="failed",
+                        details={
+                            "name": "u1/u2",
+                            "error_type": type(exc).__name__,
+                            "reason": str(exc),
+                        },
+                        level=logging.WARNING,
+                    )
 
-            # --- 一般 aux_outputs ---
-            if ds.aux_outputs:
-                aux_fns = parser.lambdify_aux(ds.aux_outputs)
-                for name, fn in aux_fns.items():
-                    if name not in aux_data:  # 不覆盖 lunula 反推
-                        vals = np.array([fn(t, *yd[:, i]) for i, t in enumerate(td)])
-                        aux_data[name] = vals
-                        aux_names.append(name)
+        for name, expression in problem.auxiliary_expressions.items():
+            if name in aux_data:
+                continue
+            try:
+                function = parser.lambdify_aux({name: expression})[name]
+                values = np.array(
+                    [
+                        function(time_value, *yd[:, index])
+                        for index, time_value in enumerate(td)
+                    ],
+                    dtype=float,
+                ).reshape(-1)
+                if values.size != td.size or not np.isfinite(values).all():
+                    raise ValueError("values are non-finite or have an invalid shape")
+                aux_data[name] = values
+            except Exception as exc:
+                diagnostic = (
+                    f"auxiliary {name!r} failed: {type(exc).__name__}: {exc}"
+                )
+                errors.append(diagnostic)
+                LOGGER.warning("Request %s: %s", request.request_id, diagnostic)
+                context = self._run_contexts.get(request.request_id)
+                if context is not None:
+                    emit_solver_event(
+                        context,
+                        "auxiliary_output_failed",
+                        phase="auxiliary",
+                        status="failed",
+                        details={
+                            "name": name,
+                            "error_type": type(exc).__name__,
+                            "reason": str(exc),
+                        },
+                        level=logging.WARNING,
+                    )
 
-            if aux_data:
-                result["aux"] = aux_data
-                result["aux_names"] = aux_names
-        except Exception:
-            pass
-        return result
-
-    def _on_solve_error(self, msg: str):
-        t = self.TRANSLATIONS[self.current_lang]
-        self.btn_solve.setEnabled(True)
-        self.progress_bar_label.setStyleSheet(
-            "background-color: #e74c3c; color: white; "
-            "padding: 4px 8px; border-radius: 4px; font-weight: bold;"
-        )
-        self.progress_bar_label.setText(t["status_error"])
-        self.progress_detail.setText(msg[:200])
-        if self.current_task_idx >= 0:
-            self._task_status[self.current_task_idx] = "error"
-            self._refresh_task_table()
-        QMessageBox.critical(self, "Error", msg)
+        return aux_data, td, tuple(errors)
 
     # ------------------------------------------------------------------
     # Построение графиков
@@ -2304,26 +2488,38 @@ class BvpSolverApp(QMainWindow):
 
     def on_plot(self):
         t = self.TRANSLATIONS[self.current_lang]
-        if not self.all_results:
+        if not self.solve_records or self.last_record is None:
             QMessageBox.warning(self, "Warning", t["err_no_solution"])
             return
 
-        var_names = self.eq_editor.get_var_names()
-        # 收集所有辅助变量名（去重）
-        aux_names_set = set()
-        for r in self.all_results:
-            aux_names_set.update(r.get("aux_names", []))
-        aux_names = sorted(aux_names_set)
+        compatible_records, rejected = partition_plot_records(
+            self.solve_records, self.last_record
+        )
+        if rejected:
+            summary = "; ".join(
+                f"{record.request.task_name}[{record.request_id[:8]}]: {reason}"
+                for record, reason in rejected
+            )
+            diagnostic = (
+                f"Plot isolation kept {len(compatible_records)} compatible "
+                f"record(s) and excluded {len(rejected)}: {summary}"
+            )
+            self.progress_detail.setText(diagnostic)
+            LOGGER.warning(diagnostic)
         if hasattr(self, '_plot_widget') and self._plot_widget is not None:
             try:
-                self._plot_widget.update_data(var_names, self.all_results, aux_names, lang=self.current_lang)
+                self._plot_widget.update_data(
+                    list(compatible_records), lang=self.current_lang
+                )
                 self._plot_widget.show()
                 self._plot_widget.raise_()
                 self._plot_widget.activateWindow()
                 return
             except RuntimeError:
                 self._plot_widget = None
-        self._plot_widget = IntegratedPlotWidget(var_names, self.all_results, aux_names, lang=self.current_lang, parent=self)
+        self._plot_widget = IntegratedPlotWidget(
+            list(compatible_records), lang=self.current_lang, parent=self
+        )
         self._plot_widget.show()
         self._plot_widget.raise_()
         self._plot_widget.activateWindow()
@@ -2362,6 +2558,7 @@ class BvpSolverApp(QMainWindow):
         # ---- 1. Собираем данные ----
         # curves: (sol_idx, y_var_name, x_arr, y_arr)
         curves = []
+        plot_diagnostics = []
         for i, r in enumerate(all_results):
             if i not in visible:
                 continue
@@ -2379,10 +2576,20 @@ class BvpSolverApp(QMainWindow):
                     try:
                         yd_arr, yl = axis_data(y_name, td, yd)
                         curves.append((i, y_name, np.asarray(xd), np.asarray(yd_arr)))
-                    except Exception:
-                        continue
-            except Exception:
-                continue
+                    except (ValueError, IndexError, TypeError) as exc:
+                        plot_diagnostics.append(
+                            f"solution {i + 1}, axis {y_name!r}: "
+                            f"{type(exc).__name__}: {exc}"
+                        )
+            except (KeyError, ValueError, IndexError, TypeError, AttributeError) as exc:
+                plot_diagnostics.append(
+                    f"solution {i + 1}: {type(exc).__name__}: {exc}"
+                )
+
+        if plot_diagnostics:
+            diagnostic = " | ".join(plot_diagnostics)
+            self.progress_detail.setText(diagnostic)
+            LOGGER.warning("Legacy plot diagnostic: %s", diagnostic)
 
         if not curves:
             QMessageBox.warning(self, "Plot", "Нет данных")
@@ -2487,7 +2694,8 @@ class BvpSolverApp(QMainWindow):
         try:
             plt.show(block=False)
             plt.pause(0.001)
-        except Exception:
+        except Exception as exc:
+            LOGGER.warning("Non-blocking plot display failed: %s", exc)
             plt.show()
 
     def _draw_phase_with_crossing(self, curves, ax, colors):
@@ -2562,7 +2770,7 @@ class BvpSolverApp(QMainWindow):
 
     def on_export(self):
         t = self.TRANSLATIONS[self.current_lang]
-        if self.last_result is None:
+        if self.last_record is None:
             QMessageBox.warning(self, "Warning", t["err_no_solution"])
             return
 
@@ -2572,47 +2780,70 @@ class BvpSolverApp(QMainWindow):
         if not path:
             return
 
-        result = self.last_result
-        var_names = self.eq_editor.get_var_names()
-
-        if path.endswith(".json"):
-            export_data = {
-                "method": result["method"],
-                "iterations": result["iterations"],
-                "residual_norm": result["residual_norm"],
-                "p_opt": result["p_opt"].tolist(),
-                "var_names": var_names,
-                "t": result["t"].tolist(),
-                "y": {name: result["y"][i].tolist()
-                      for i, name in enumerate(var_names)},
-            }
-            with open(path, "w", encoding="utf-8") as f:
-                json.dump(export_data, f, indent=2, ensure_ascii=False)
-        else:
-            with open(path, "w") as f:
-                # Header
-                header = "# t" + "".join([f"\t{name}" for name in var_names])
-                f.write(header + "\n")
-                for i in range(len(result["t"])):
-                    line = f"{result['t'][i]:.8f}"
-                    for j in range(len(var_names)):
-                        line += f"\t{result['y'][j, i]:.8f}"
-                    f.write(line + "\n")
-
+        record = self.last_record
+        context = (
+            metadata_context(record.result.run_metadata)
+            if record.result.run_metadata is not None
+            else self._run_contexts.get(record.request_id)
+        )
+        if context is not None:
+            emit_solver_event(
+                context,
+                "export_started",
+                phase="export",
+                status="running",
+                details={"format": "json" if path.lower().endswith(".json") else "text"},
+            )
+        try:
+            canonical = build_canonical_export_record(record)
+            export_canonical_record(path, canonical)
+        except Exception as exc:
+            if context is not None:
+                emit_solver_event(
+                    context,
+                    "export_failed",
+                    phase="export",
+                    status="failed",
+                    details={"error_type": type(exc).__name__, "reason": str(exc)},
+                    level=logging.ERROR,
+                )
+            QMessageBox.critical(self, "Export failed", f"{type(exc).__name__}: {exc}")
+            return
+        if context is not None:
+            emit_solver_event(
+                context,
+                "export_succeeded",
+                phase="export",
+                status="completed",
+                details={"format": "json" if path.lower().endswith(".json") else "text"},
+            )
         self.progress_detail.setText(f"已导出: {path}")
 
     def on_clear(self):
         t = self.TRANSLATIONS[self.current_lang]
         reply = QMessageBox.question(self, "Confirm", t["confirm_clear"])
         if reply == QMessageBox.Yes:
-            self.last_result = None
-            self.all_results = []
+            self.last_record = None
+            self.last_failed_record = None
+            self.last_cancelled_outcome = None
+            self.solve_records.clear()
             self._task_status.clear()
+            self._run_contexts.clear()
             self._refresh_task_table()
-            # 清除绿色样式
-            self.progress_bar_label.setStyleSheet("")
-            self.progress_bar_label.setText(t["status_ready"])
+            if hasattr(self, "_plot_widget") and self._plot_widget is not None:
+                try:
+                    self._plot_widget.close()
+                except RuntimeError:
+                    LOGGER.info("Plot widget was already destroyed during clear")
+                self._plot_widget = None
             self.progress_detail.setText("")
+            if self.solve_state not in {
+                GuiSolveState.RUNNING,
+                GuiSolveState.CANCEL_REQUESTED,
+            }:
+                self._set_gui_state(GuiSolveState.IDLE)
+            else:
+                self._render_gui_state()
 
     # ------------------------------------------------------------------
     # Локализация
@@ -2696,19 +2927,15 @@ class BvpSolverApp(QMainWindow):
 
         # ---- Action buttons ----
         self.btn_solve.setText(t["btn_solve"])
+        self.btn_cancel.setText(t["btn_cancel"])
         self.btn_plot.setText(t["btn_plot"])
         self.btn_export.setText(t["btn_export"])
         self.btn_clear.setText(t["btn_clear"])
 
         # (状态栏已移除)
 
-        # ---- 同步进度标签语言 ----
-        if self.last_result is not None:
-            self.progress_bar_label.setText(t["status_solved"])
-        elif self.current_task_idx >= 0 and self._task_status.get(self.current_task_idx) == "error":
-            self.progress_bar_label.setText(t["status_error"])
-        else:
-            self.progress_bar_label.setText(t["status_ready"])
+        # ---- 同步进度标签语言和集中状态 ----
+        self._render_gui_state()
 
         # ---- 同步更新绘图窗口语言 ----
         if hasattr(self, '_plot_widget') and self._plot_widget is not None:
@@ -2716,6 +2943,50 @@ class BvpSolverApp(QMainWindow):
                 self._plot_widget.set_lang(lang)
             except RuntimeError:
                 self._plot_widget = None
+
+    def closeEvent(self, event) -> None:
+        """Cooperatively cancel and join the active worker before destruction."""
+        self._closing = True
+        worker = self.active_worker
+        if worker is not None and worker.isRunning():
+            if hasattr(worker, "request_cancel"):
+                worker.request_cancel()
+            elif self.active_cancellation_token is not None:
+                self.active_cancellation_token.cancel()
+            if self.solve_state is GuiSolveState.RUNNING:
+                self._set_gui_state(
+                    GuiSolveState.CANCEL_REQUESTED,
+                    "Window close requested cancellation; waiting for worker exit.",
+                )
+            LOGGER.info(
+                "Window close is waiting for request %s",
+                self.active_request_id,
+            )
+            if not worker.wait(self.close_wait_timeout_ms):
+                diagnostic = (
+                    "Window close wait timed out; the worker remains active and the "
+                    "window was not destroyed."
+                )
+                LOGGER.warning(diagnostic)
+                context = self._run_contexts.get(self.active_request_id or "")
+                if context is not None:
+                    emit_solver_event(
+                        context,
+                        "window_close_wait_timeout",
+                        phase="gui",
+                        status="timeout",
+                        details={"timeout_ms": self.close_wait_timeout_ms},
+                        level=logging.WARNING,
+                    )
+                self.progress_detail.setText(diagnostic)
+                self._closing = False
+                event.ignore()
+                return
+
+        self.active_worker = None
+        self.active_request_id = None
+        self.active_cancellation_token = None
+        event.accept()
 
 
 # ---------------------------------------------------------------------------
