@@ -1,0 +1,24 @@
+{
+  "schema_version": "bvp-report-metadata-v1",
+  "project_version": "2.0",
+  "report_title": "Отчёт о проделанной работе по практикуму: Универсальный решатель краевых задач (BVP) с методом продолжения по параметру на Python / PyQt5",
+  "report_type": "course_report",
+  "snapshot_status": "historical_snapshot",
+  "git_commit": "a4ef249dc72fef071ff0cf5b6abe650909298832",
+  "git_tag": null,
+  "branch_at_creation": null,
+  "report_created_at": "2026-05-25T08:51:54+08:00",
+  "report_revision": 1,
+  "test_count": null,
+  "local_validation_status": "not_recorded_for_this_version",
+  "remote_ci_status": "not_available_in_this_version",
+  "license_status": "license_decision_required",
+  "mapping_confidence": "high",
+  "report_sha256": "5ed71322f97f78ec1a3b0a15e3d7d2af19a70da58a3ab26c9f57a2d209ece4f2",
+  "notes": [
+    "The archived PDF is byte-identical to the original local course report and its body is frozen.",
+    "The commit binding is evidence-based: the PDF date and described architecture match the earliest complete tracked v2.0 snapshot.",
+    "The report predates automated repository CI; current CI results must not be projected backward onto this version.",
+    "No Git tag existed when this metadata was created."
+  ]
+}
