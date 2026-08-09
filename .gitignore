@@ -26,3 +26,6 @@ Thumbs.db
 
 # PDF / binary output
 *.pdf
+
+# Intentionally archived, version-bound historical reports
+!docs/reports/**/*.pdf

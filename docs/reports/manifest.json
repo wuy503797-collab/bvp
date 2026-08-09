@@ -1,0 +1,126 @@
+{
+  "schema_version": "bvp-report-manifest-v1",
+  "reports": [
+    {
+      "version": "1.0",
+      "directory": null,
+      "title": "BVP Solver v1.0",
+      "report_type": null,
+      "snapshot_status": "historical_version_without_preserved_commit",
+      "git_commit": null,
+      "git_tag": null,
+      "report_available": false
+    },
+    {
+      "version": "2.0",
+      "directory": "v2.0",
+      "title": "Universal BVP Solver Course Report",
+      "report_type": "course_report",
+      "snapshot_status": "historical_snapshot",
+      "git_commit": "a4ef249dc72fef071ff0cf5b6abe650909298832",
+      "git_tag": null,
+      "report_available": true,
+      "report_file": "v2.0/original-course-report.pdf"
+    },
+    {
+      "version": "2.1",
+      "directory": null,
+      "title": "BVP Solver v2.1",
+      "report_type": null,
+      "snapshot_status": "historical_snapshot",
+      "git_commit": "b9cb298f6b3dc132d39cc99c6a6bd61342f664a0",
+      "git_tag": null,
+      "report_available": false
+    },
+    {
+      "version": "2.2",
+      "directory": null,
+      "title": "BVP Solver v2.2",
+      "report_type": null,
+      "snapshot_status": "historical_snapshot",
+      "git_commit": "fdcc6723453dff194af066ffa3455c3ec7f5a493",
+      "git_tag": null,
+      "report_available": false
+    },
+    {
+      "version": "2.3",
+      "directory": null,
+      "title": "BVP Solver v2.3",
+      "report_type": null,
+      "snapshot_status": "historical_snapshot",
+      "git_commit": "525fac1f22e7850d113bda532935bf1ab6737c2a",
+      "git_tag": null,
+      "report_available": false
+    },
+    {
+      "version": "2.4",
+      "directory": null,
+      "title": "BVP Solver v2.4",
+      "report_type": null,
+      "snapshot_status": "historical_snapshot",
+      "git_commit": "eeee178fed219bd97b0fa8062018231c0b74d3d6",
+      "git_tag": null,
+      "report_available": false
+    },
+    {
+      "version": "2.5",
+      "directory": null,
+      "title": "BVP Solver v2.5",
+      "report_type": null,
+      "snapshot_status": "historical_snapshot",
+      "git_commit": "5f480c3ab8e3feab77e585a044f8747404dbc931",
+      "git_tag": null,
+      "report_available": false
+    },
+    {
+      "version": "2.6",
+      "directory": null,
+      "title": "BVP Solver v2.6",
+      "report_type": null,
+      "snapshot_status": "historical_snapshot",
+      "git_commit": "e732b4efb0a97bd348d41bd86c42c796f3b72ace",
+      "git_tag": null,
+      "report_available": false
+    },
+    {
+      "version": "2.7",
+      "directory": null,
+      "title": "BVP Solver v2.7",
+      "report_type": null,
+      "snapshot_status": "historical_snapshot",
+      "git_commit": "b11dc1accc357364d40d461df9a848896ccff2e7",
+      "git_tag": null,
+      "report_available": false
+    },
+    {
+      "version": "2.8",
+      "directory": null,
+      "title": "BVP Solver v2.8",
+      "report_type": null,
+      "snapshot_status": "historical_snapshot",
+      "git_commit": "2b1c6d74e14bc7bfe80653f8a5ded805594dcc61",
+      "git_tag": null,
+      "report_available": false
+    },
+    {
+      "version": "2.9",
+      "directory": null,
+      "title": "BVP Solver v2.9",
+      "report_type": null,
+      "snapshot_status": "historical_snapshot",
+      "git_commit": "7cea5d38f5fe25a169824654968dfc895b4f7b97",
+      "git_tag": null,
+      "report_available": false
+    },
+    {
+      "version": "2.10",
+      "directory": null,
+      "title": "BVP Solver v2.10",
+      "report_type": null,
+      "snapshot_status": "historical_snapshot",
+      "git_commit": "2ac1a20bf337bffd816582d1670af096c9f87dc0",
+      "git_tag": null,
+      "report_available": false
+    }
+  ]
+}
