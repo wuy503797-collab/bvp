@@ -7,7 +7,7 @@
   "git_commit": "2ac1a20",
   "main_merge_commit": "1413ba43",
   "git_tag": null,
-  "report_document_commit": null,
+  "report_document_commit": "64622bd4b5c79753c1610510a2a70f731c933351",
   "test_count": 285,
   "local_validation_status": "PASS",
   "remote_ci_status": "PASS",
