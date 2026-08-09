@@ -1,6 +1,20 @@
 CHANGELOG
 =========
 
+v2.10 (2026-08)
+- 删除全局 Matplotlib 实验性 toolmanager 设置，保留 NavigationToolbar2QT，并将默认 pytest 警告清零
+- 修复同一任务不同数值输入被错误隔离的问题，覆盖初始猜测、方程/边界数值、已知初值、区间、方法、容差和延拓步数；冻结每次主曲线采样并支持 26.1 多解分支同时勾选和叠加
+- 审计运行、开发和精确参考依赖；明确 requirements-lock 只锁定直接依赖而非全部传递依赖
+- 新增统一 CI 验证脚本，串联 pip check、无警告导入、compileall、pytest 和全部确定性阶段验证
+- 为性能验证增加 --ci 模式，只检查数值等价、Jacobian、Phi 复用、计数器和导出，不设置耗时门槛
+- 新增只读仓库卫生、有限秘密模式、README 路径、本机绝对路径、缓存和大文件检查
+- 新增 GitHub Actions，在 Windows/Linux 的 Python 3.11 范围环境和 Ubuntu 精确直接依赖参考环境运行
+- 新增 CONTRIBUTING.md 与 SECURITY.md，明确数值证据、安全边界和离屏 GUI 回归要求
+- 整理 README 的干净环境、CI、仓库卫生、适用范围、架构和发布前决策说明
+- 保留课程/项目 PDF、示例 JSON、负向数据、空 gui.py 和独立 26.1 基线，不在本阶段混合删除
+- 仓库仍无 LICENSE；许可证选择保留为发布前用户决策
+- 状态输出区分本地验证与远端 CI：本地为 PASS，推送前发布准备保持 PENDING_REMOTE_CI_AND_LICENSE
+
 v2.9 (2026-08)
 - 新增 SolverCounters 与不可变快照，区分 Phi、Jacobian、IVP、底层 nfev、root/least-squares、延拓、Newton、阻尼和最终验收
 - 为 RunMetadata 增加 core/API 时间边界和性能计数，保持既有 elapsed_seconds 的公共 API 总时间语义

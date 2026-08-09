@@ -412,6 +412,55 @@ def test_plot_uses_latest_record_metadata_and_excludes_incompatible_history(
     assert "excluded 1" in window.progress_detail.text()
 
 
+def test_plot_keeps_numeric_variants_from_the_same_task(window, monkeypatch) -> None:
+    first_request = _request("Variant", task_id="stable-task")
+    second_request = SolveRequest.create(
+        problem=BVPProblem(
+            name="Variant",
+            odes=["2*x"],
+            var_names=["x"],
+            boundary_conditions=["x0_T - 2"],
+            known_indices=[],
+            unknown_indices=[0],
+            known_values={},
+            initial_guess=[0.75],
+            t_end=2.0,
+        ),
+        config=SolverConfig(
+            method="continuation",
+            ivp_method="DOP853",
+            eps=1e-6,
+            continuation_steps=25,
+        ),
+        source_task_id="stable-task",
+        source_task_index=0,
+    )
+    first = SolveRecord(first_request, _successful_result(-1.0))
+    second = SolveRecord(second_request, _successful_result(1.0))
+    window.solve_records = [first, second]
+    window.last_record = second
+    captured = {}
+
+    class FakePlotWidget:
+        def __init__(self, records, lang, parent):
+            captured["records"] = records
+
+        def show(self):
+            pass
+
+        def raise_(self):
+            pass
+
+        def activateWindow(self):
+            pass
+
+    monkeypatch.setattr("main.IntegratedPlotWidget", FakePlotWidget)
+    window.on_plot()
+
+    assert captured["records"] == [first, second]
+    assert "excluded" not in window.progress_detail.text()
+
+
 def test_failed_and_cancelled_outcomes_never_enter_success_history(window) -> None:
     failed_request = _request("failed")
     _activate(window, failed_request)

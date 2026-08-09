@@ -1,12 +1,25 @@
 # BVP Solver — 通用常微分方程边值问题求解器 / Универсальный решатель краевых задач
 
-这是一个使用 Python、SciPy、SymPy、PyQt5 和 Matplotlib 开发的边值问题（Boundary Value Problem，BVP）求解与可视化项目。程序目前提供参数延拓法和打靶法，支持从 JSON 加载任务、交互绘图以及结果导出。
+[![CI](https://github.com/wuy503797-collab/bvp/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/wuy503797-collab/bvp/actions/workflows/ci.yml)
+
+这是一个使用 Python、SciPy、SymPy、PyQt5 和 Matplotlib 开发的通用一阶常微分方程系统边值问题（Boundary Value Problem，BVP）教学与实验型求解器。程序提供打靶法和参数延拓法、PyQt5 GUI、无窗口 Python API、JSON 任务加载、交互绘图和原子结果导出。
 
 项目仍处于早期迭代阶段。当前已建立统一的结果验收、26.1 双体问题基线，以及若干解析解和制造解验证。现有证据只覆盖文中列出的具体问题，因此本项目仍不应被视为可用于生产或高风险计算的可信数值软件发布版。
 
-## 已验证环境
+## 核心功能与正确性边界
 
-当前宿主环境实际验证使用：
+- 不可变 `BVPProblem`、`SolverConfig`、`BVPResult` 以及无 Qt 副作用的核心 API；
+- 打靶、root→least-squares fallback 和固定流程的参数延拓；
+- 受限 AST-to-SymPy 数学表达式语言，不执行任意 Python/SymPy 代码；
+- 分离的 IVP、非线性求解、Jacobian 和最终尺度化边界验收容差；
+- GUI 请求快照、结果溯源、协作式取消和离屏生命周期测试；
+- 结构化日志、运行元数据、性能计数、统一 JSON/TXT schema 和原子写入。
+
+通过表达式安全检查、优化器收敛或某一组基线都不等价于证明任意 BVP 有解或数值结果可信。最终结果仍必须通过 IVP、有限性、算法状态和逐分量边界验收。
+
+## 正式验证环境
+
+当前正式验证基线为 Python 3.11。第十一阶段在独立于仓库现有 `venv/` 的范围环境和精确直接依赖参考环境中复验；GitHub Actions 工作流配置为在 `windows-latest` 与 `ubuntu-latest` 上运行 Python 3.11。其他 Python 版本尚不属于正式支持声明。
 
 | 组件 | 版本 |
 | --- | --- |
@@ -18,41 +31,56 @@
 | PyQt5 | 5.15.11 |
 | pytest | 9.0.3 |
 
-`requirements.txt` 中的范围是安装约束，不代表其中每一种版本组合都已经通过 CI 或全新机器验证。`requirements-lock.txt` 只记录当前已实际运行成功的精确组合，也尚未在全新机器上完成重建验证。
+`requirements.txt` 只声明项目直接运行依赖的兼容范围；`requirements-dev.txt` 在此基础上增加 pytest。`requirements-lock.txt` 固定当前 Python 3.11 参考环境中的直接依赖和 pytest，但传递依赖仍由 pip 解析，因此它不是带哈希的完整传递依赖锁。范围约束不代表其中每一种可能组合都经过 CI。
 
-## 环境安装与激活
+## 快速开始与干净环境安装
 
-运行依赖：
+不要把仓库已有的 `venv/` 当作复现证据。PowerShell 中可创建新的 Python 3.11 环境：
+
+```powershell
+py -3.11 -m venv .venv-clean
+.\.venv-clean\Scripts\python.exe -m pip install --upgrade pip
+.\.venv-clean\Scripts\python.exe -m pip install -r requirements-dev.txt
+.\.venv-clean\Scripts\python.exe -m pytest -q
+```
+
+Linux 或 macOS 中可使用：
 
 ```bash
-pip install -r requirements.txt
+python3.11 -m venv .venv-clean
+.venv-clean/bin/python -m pip install --upgrade pip
+.venv-clean/bin/python -m pip install -r requirements-dev.txt
+.venv-clean/bin/python -m pytest -q
+```
+
+Windows Git Bash 使用虚拟环境的 `Scripts` 目录：
+
+```bash
+python -m venv .venv-clean
+.venv-clean/Scripts/python.exe -m pip install --upgrade pip
+.venv-clean/Scripts/python.exe -m pip install -r requirements-dev.txt
+.venv-clean/Scripts/python.exe -m pytest -q
+```
+
+只运行 GUI 或核心 API 时安装直接运行依赖：
+
+```bash
+python -m pip install -r requirements.txt
 ```
 
 开发和测试依赖：
 
 ```bash
-pip install -r requirements-dev.txt
+python -m pip install -r requirements-dev.txt
 ```
 
-如需复现当前已验证的精确包版本：
+如需安装当前精确直接依赖参考版本：
 
 ```bash
-pip install -r requirements-lock.txt
+python -m pip install -r requirements-lock.txt
 ```
 
-Git Bash 激活现有虚拟环境：
-
-```bash
-source venv/Scripts/activate
-```
-
-PowerShell 激活现有虚拟环境：
-
-```powershell
-.\venv\Scripts\Activate.ps1
-```
-
-虚拟环境目录 `venv/` 或 `.venv/` 属于本地环境，不应提交到仓库。
+虚拟环境目录 `venv/`、`.venv/` 或 `.venv-*/` 属于本地环境，不应提交到仓库。安装后建议运行 `python -m pip check`。
 
 ## 启动 GUI
 
@@ -69,9 +97,15 @@ python main.py
 编辑、重排或删除任务都不会改变这份请求。每个成功结果以 `SolveRecord` 保存并永久
 绑定自己的请求快照；失败和取消保留请求及诊断，但不会进入成功历史。
 
-绘图和导出使用结果自身的变量名与问题元数据，不再读取完成时的当前编辑器。绘图默认
-以最新成功记录为基准，只叠加状态维数、变量含义、方程、边界条件和时间区间均兼容的
-历史记录；不兼容记录会被明确隔离并显示原因，而不是静默跳过。
+绘图和导出使用结果自身的变量名与问题元数据，不再读取完成时的当前编辑器。每个成功
+记录还会在完成时保存只读的主曲线采样，因此后续编辑输入或修改 SciPy dense-output 对象
+都不能改变旧曲线。
+
+绘图默认以最新成功记录为基准。同一稳定任务身份下，只要状态维数和变量含义不变，修改
+初始猜测、方程数值、边界目标、已知初值、积分区间、辅助量、求解方法、IVP 方法、容差或
+延拓步数后得到的结果都可同时保留并默认勾选。不同任务仍按问题快照隔离，避免把无关题目
+自动混入；不兼容记录会明确显示原因。解列表显示请求/问题签名、`guess`、方法和容差，完整
+`problem_signature` 仍区分各次请求，导出和运行关联没有被弱化。
 
 “取消”采用协作式检查点，不会强制终止线程。取消请求会在解析、求解阶段边界、打靶
 fallback、延拓步骤/Newton 迭代和最终验收附近被检查；正在执行的单次 SciPy
@@ -329,6 +363,10 @@ python scripts/run_performance_validation.py
 python -m pytest -q
 ```
 
+当前测试集合为 285 项，默认运行目标为 0 warnings。此前唯一警告来自全局启用 Matplotlib
+实验性 `toolmanager`；绘图组件实际使用稳定的 `NavigationToolbar2QT`，因此已删除该全局
+设置，没有增加 warning ignore 或改变绘图入口。
+
 测试分为：
 
 - 正向数值基线：确认当前 26.1 双体问题仍能得到有限结果和合格的终端边界残差；
@@ -355,6 +393,54 @@ python -m pytest -v tests/core
 ```bash
 python -m pytest -v tests/numerical
 ```
+
+## 持续集成与发布前验证
+
+统一验证入口会输出 Python/依赖版本，并依次执行 `pip check`、无警告导入、`compileall`、
+完整 pytest、数值基线、解析/制造解、表达式安全、容差、可观测性/导出、确定性性能契约和
+仓库卫生检查：
+
+```bash
+python scripts/run_ci_validation.py
+```
+
+`.github/workflows/ci.yml` 在 push 和 pull request 上运行。范围依赖 job 覆盖
+`windows-latest` 与 `ubuntu-latest` 的 Python 3.11；精确直接依赖参考 job 另在 Ubuntu
+安装 `requirements-lock.txt`。GUI 测试不被跳过，Qt 使用 `QT_QPA_PLATFORM=offscreen`。
+工作流不使用 `continue-on-error`，也不把固定耗时或“至少提升某百分比”作为性能门槛。
+CI 性能模式只验证数值等价、Jacobian、Phi 复用、变分 IVP 为零、计数器一致和元数据导出。
+
+当前第十一阶段状态严格区分本地证据、远端证据和发布许可：
+
+```text
+phase_eleven_local_status=PASS
+release_readiness_status=PENDING_REMOTE_CI_AND_LICENSE
+```
+
+本地环境、两个独立干净环境、285 项测试和全部验证脚本已经通过。以上结论不等于
+GitHub Actions 已通过；只有该提交推送后，Windows、Ubuntu 范围依赖和 Ubuntu 精确依赖
+三个远端任务实际成功，才能记录远端 CI 通过。仓库尚无 `LICENSE`，这不是代码缺陷，
+但在许可证确定前不创建正式 release 或版本 tag，也不宣称他人已经获得复制、修改或分发许可。
+
+本地完整性能脚本仍保留预热、重复中位数和 profile；CI 调用轻量确定性模式：
+
+```bash
+python scripts/run_performance_validation.py --ci
+```
+
+仓库卫生检查为只读操作，不会自动删除文件。它检查被跟踪的环境/缓存/临时文件、有限的
+疑似秘密模式、本机绝对路径、README 相对链接、大小写和大文件，并分类已知旧文件：
+
+```bash
+python scripts/check_repository_hygiene.py
+```
+
+当前课程与项目报告 PDF 是用户有意保留但被 Git 忽略的项目材料；重复任务 JSON 和空
+`gui.py` 留待独立清理决策，不在 CI 阶段删除。贡献要求见
+[CONTRIBUTING.md](CONTRIBUTING.md)，安全边界和报告方式见 [SECURITY.md](SECURITY.md)。
+
+仓库当前没有 `LICENSE`。这意味着许可证仍需仓库所有者在发布前决定；README 不据此
+声称项目已经采用某种开源许可证，CI 也不会因缺少许可证失败。
 
 ## 表达式语言与安全边界
 
@@ -491,6 +577,35 @@ D_i = y(t_{i+1}) - y(t_i)
 - `BVP-P1-002`：奇异 IVP 返回结构化失败和底层诊断。
 
 当前测试中不再保留这些编号的 `xfail`。数值验证通过并不证明未测试的任务或所有 BVP 都正确。
+
+## 项目架构
+
+```text
+bvp_core/                    无窗口问题模型、表达式、求解、验收、元数据与导出
+main.py                      Dataset/旧 JSON 兼容、Qt worker、主窗口和绘图
+validation_metrics.py        解析解/制造解采样与独立构造的数值一致性指标
+scripts/run_*.py             可执行阶段验证入口
+scripts/check_repository_hygiene.py
+tests/core/                  核心 API、模型、安全、容差、性能和导出契约
+tests/gui/                   Qt 离屏请求、线程、关闭、绘图与警告回归
+tests/numerical/             解析解、制造解和容差敏感性
+.github/workflows/ci.yml     Python 3.11 Windows/Linux 持续集成
+```
+
+`solver.py` 是仍被 26.1 独立基线使用的兼容实现；它不是 `bvp_core` 求解器的第二份公共
+事实来源。`task_error_test.json` 属于负向测试数据，其余任务 JSON 是示例和兼容性夹具。
+
+## 已知限制与开发计划
+
+- 当前正式验证只覆盖 Python 3.11、文档列出的解析/制造问题和 26.1 基线；
+- 当前 Jacobian 是参数前向有限差分，不是解析或自动微分 Jacobian；
+- 参数延拓使用固定流程，不能保证跨越所有奇点、转折点或找到全部分支；
+- 协作式取消不能中断正在执行的单次 SciPy `solve_ivp`；
+- 精确参考文件没有锁定或哈希全部传递依赖；
+- GitHub 托管的 Windows/Linux 状态以真实 CI badge 和工作流记录为准；
+- 正式公开发布前仍需由仓库所有者决定许可证，并另行判断空 `gui.py` 和重复示例数据是否清理。
+
+后续迭代应优先依据 CI 和数值验证发现的问题推进，不因平台波动随意放宽既有数学门槛。
 
 ## 文档说明
 

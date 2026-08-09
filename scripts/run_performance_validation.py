@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import argparse
 import cProfile
 import json
 import platform
@@ -242,13 +243,19 @@ def _implementation(*, legacy_reference: bool) -> Iterator[None]:
         BVPSolver._dPhi_dp = current
 
 
-def _measure(case: BenchmarkCase, *, legacy_reference: bool) -> dict[str, Any]:
+def _measure(
+    case: BenchmarkCase,
+    *,
+    legacy_reference: bool,
+    repeats: int | None = None,
+) -> dict[str, Any]:
     with _implementation(legacy_reference=legacy_reference):
         solve_bvp_problem(case.problem, case.config)
         core_times: list[float] = []
         api_times: list[float] = []
         results = []
-        for _ in range(case.repeats):
+        repeat_count = case.repeats if repeats is None else repeats
+        for _ in range(repeat_count):
             result = solve_bvp_problem(case.problem, case.config)
             metadata = result.run_metadata
             assert metadata is not None and metadata.core_elapsed_seconds is not None
@@ -419,7 +426,20 @@ def _profile_hotspots(
     return totals
 
 
-def main() -> int:
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(
+        description="Validate deterministic solver performance evidence."
+    )
+    parser.add_argument(
+        "--ci",
+        action="store_true",
+        help=(
+            "run one measured solve per case and skip timing profiles; "
+            "all deterministic counter and numerical checks remain enabled"
+        ),
+    )
+    arguments = parser.parse_args(argv)
+
     print("[environment]")
     print(f"python={platform.python_version()}")
     print(f"numpy={np.__version__}")
@@ -428,10 +448,16 @@ def main() -> int:
     print(f"system={platform.system()}")
     print(f"machine={platform.machine()}")
     print("scope=current machine and dependency combination only")
+    print(f"ci_mode={arguments.ci}")
 
     cases = _cases()
-    before_rows = [_measure(case, legacy_reference=True) for case in cases]
-    after_rows = [_measure(case, legacy_reference=False) for case in cases]
+    repeats = 1 if arguments.ci else None
+    before_rows = [
+        _measure(case, legacy_reference=True, repeats=repeats) for case in cases
+    ]
+    after_rows = [
+        _measure(case, legacy_reference=False, repeats=repeats) for case in cases
+    ]
 
     print("\n[before-after]")
     print(
@@ -464,14 +490,17 @@ def main() -> int:
     print(f"before_variational={jacobian_before['variational_ivp_solves']}")
     print(f"after_variational={jacobian_after['variational_ivp_solves']}")
 
-    before_profile = _profile_hotspots(cases[4], legacy_reference=True)
-    after_profile = _profile_hotspots(cases[4], legacy_reference=False)
     print("\n[26.1-continuation-profile]")
-    for name in sorted(before_profile):
-        print(
-            f"{name} before={before_profile[name]:.12g} "
-            f"after={after_profile[name]:.12g}"
-        )
+    if arguments.ci:
+        print("skipped=ci-mode-deterministic-checks-only")
+    else:
+        before_profile = _profile_hotspots(cases[4], legacy_reference=True)
+        after_profile = _profile_hotspots(cases[4], legacy_reference=False)
+        for name in sorted(before_profile):
+            print(
+                f"{name} before={before_profile[name]:.12g} "
+                f"after={after_profile[name]:.12g}"
+            )
 
     compilation_counts = _expression_compilation_counts()
     print("\n[expression-compilation]")

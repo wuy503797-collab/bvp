@@ -1,6 +1,6 @@
-# Exact package versions exercised with Python 3.11.9 in the current host venv.
-# This file records the known-working environment; it has not yet been rebuilt
-# and verified on a clean machine.
+# Exact direct dependency versions for the Python 3.11 reference environment.
+# Transitive dependencies are resolved by pip, so this is a reference set rather
+# than a complete hash-locked environment.
 numpy==2.4.4
 scipy==1.17.1
 sympy==1.14.0

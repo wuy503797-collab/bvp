@@ -1,5 +1,5 @@
-# Runtime dependency ranges. Only the exact combination in requirements-lock.txt
-# has been exercised in the current host environment.
+# Direct runtime dependency ranges for Python 3.11.
+# CI validates a resolved combination; it does not promise every possible one.
 numpy>=2.4,<2.5
 scipy>=1.17,<1.18
 sympy>=1.14,<1.15

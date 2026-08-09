@@ -13,7 +13,11 @@ from uuid import uuid4
 import numpy as np
 
 from .models import BVPProblem, SolverConfig
-from .observability import RunMetadata, stable_problem_signature
+from .observability import (
+    RunMetadata,
+    canonical_problem_data,
+    stable_problem_signature,
+)
 from .results import BVPResult
 
 
@@ -25,6 +29,36 @@ def _readonly_vector(value: Any) -> np.ndarray:
     array = np.asarray(value, dtype=float).reshape(-1).copy()
     array.setflags(write=False)
     return array
+
+
+def _readonly_matrix(value: Any) -> np.ndarray:
+    array = np.asarray(value, dtype=float).copy()
+    if array.ndim != 2:
+        raise ValueError("plot state data must have shape (state, sample)")
+    array.setflags(write=False)
+    return array
+
+
+def _freeze_primary_plot_snapshot(result: BVPResult) -> tuple[np.ndarray, np.ndarray]:
+    """Sample dense output once, then detach plotting from the SciPy object."""
+    sample_t = np.asarray(result.t, dtype=float)
+    sample_y = np.asarray(result.y, dtype=float)
+    dense_solution = result.sol
+    dense_function = getattr(dense_solution, "sol", None)
+    if sample_t.size >= 2 and callable(dense_function):
+        candidate_t = np.linspace(float(sample_t[0]), float(sample_t[-1]), 500)
+        try:
+            candidate_y = np.asarray(dense_function(candidate_t), dtype=float)
+        except Exception:
+            candidate_y = np.empty((0, 0), dtype=float)
+        if (
+            candidate_y.shape == (result.y.shape[0], candidate_t.size)
+            and np.isfinite(candidate_t).all()
+            and np.isfinite(candidate_y).all()
+        ):
+            sample_t = candidate_t
+            sample_y = candidate_y
+    return _readonly_vector(sample_t), _readonly_matrix(sample_y)
 
 
 def _freeze_plain_metadata(value: Any, *, path: str = "display_metadata") -> Any:
@@ -270,6 +304,12 @@ class SolveRecord:
     )
     auxiliary_errors: tuple[str, ...] | list[str] = field(default_factory=tuple)
     completed_at: datetime = field(default_factory=_utc_now)
+    primary_plot_t: np.ndarray = field(
+        default_factory=lambda: np.array([], dtype=float)
+    )
+    primary_plot_y: np.ndarray = field(
+        default_factory=lambda: np.empty((0, 0), dtype=float)
+    )
 
     def __post_init__(self) -> None:
         if not self.result.success:
@@ -301,9 +341,25 @@ class SolveRecord:
             frozen_outputs[name] = array
         if frozen_outputs and not sample_t.size:
             raise ValueError("auxiliary outputs require an explicit sample grid")
+        plot_t = np.asarray(self.primary_plot_t, dtype=float).reshape(-1)
+        plot_y = np.asarray(self.primary_plot_y, dtype=float)
+        if not plot_t.size and not plot_y.size:
+            plot_t, plot_y = _freeze_primary_plot_snapshot(self.result)
+        else:
+            plot_t = _readonly_vector(plot_t)
+            plot_y = _readonly_matrix(plot_y)
+        if plot_y.shape != (self.request.state_dimension, plot_t.size):
+            raise ValueError(
+                "primary plot snapshot must match the request state dimension "
+                "and plot sample count"
+            )
+        if not np.isfinite(plot_t).all() or not np.isfinite(plot_y).all():
+            raise ValueError("primary plot snapshot must contain only finite values")
         object.__setattr__(self, "auxiliary_sample_t", sample_t)
         object.__setattr__(self, "auxiliary_outputs", MappingProxyType(frozen_outputs))
         object.__setattr__(self, "auxiliary_errors", tuple(self.auxiliary_errors))
+        object.__setattr__(self, "primary_plot_t", plot_t)
+        object.__setattr__(self, "primary_plot_y", plot_y)
 
     @property
     def request_id(self) -> str:
@@ -344,7 +400,13 @@ class PlotCompatibility:
 def plot_compatibility(
     anchor: SolveRecord, candidate: SolveRecord
 ) -> PlotCompatibility:
-    """Check whether two records may be intentionally overlaid."""
+    """Check whether two records may be intentionally overlaid.
+
+    Results from one stable GUI task may be compared after any numerical input
+    or solver-control edit. Separate tasks remain isolated unless their problem
+    snapshots differ only by the initial guess. In every case the plotted state
+    coordinates must retain the same names and dimension.
+    """
     for record in (anchor, candidate):
         if record.result.y.ndim != 2:
             return PlotCompatibility(False, "result state data is not two-dimensional")
@@ -356,15 +418,14 @@ def plot_compatibility(
         return PlotCompatibility(False, "state dimensions differ")
     if anchor.request.var_names != candidate.request.var_names:
         return PlotCompatibility(False, "variable names or meanings differ")
-    if not np.allclose(
-        anchor.request.time_interval,
-        candidate.request.time_interval,
-        rtol=0.0,
-        atol=1e-12,
-    ):
-        return PlotCompatibility(False, "time intervals differ")
-    if anchor.request.problem_signature != candidate.request.problem_signature:
-        return PlotCompatibility(False, "problem equations or boundaries differ")
+    if anchor.request.source_task_id == candidate.request.source_task_id:
+        return PlotCompatibility(True, "compatible variants of one source task")
+    anchor_problem = canonical_problem_data(anchor.request.problem)
+    candidate_problem = canonical_problem_data(candidate.request.problem)
+    anchor_problem.pop("initial_guess", None)
+    candidate_problem.pop("initial_guess", None)
+    if anchor_problem != candidate_problem:
+        return PlotCompatibility(False, "source tasks or problem definitions differ")
     return PlotCompatibility(True, "compatible problem snapshot")
 
 

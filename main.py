@@ -39,7 +39,6 @@ import numpy as np
 
 import matplotlib
 matplotlib.use("Qt5Agg")
-matplotlib.rcParams["toolbar"] = "toolmanager"
 import matplotlib.pyplot as plt
 from matplotlib.backends.backend_qt5agg import FigureCanvasQTAgg as FigureCanvas
 from matplotlib.backends.backend_qt5agg import NavigationToolbar2QT as NavigationToolbar
@@ -474,9 +473,18 @@ class IntegratedPlotWidget(QWidget):
     def _solution_label(self, index: int) -> str:
         record = self.records[index]
         result = record.result
+        config = record.request.config
+        guess = np.array2string(
+            np.asarray(record.request.problem.initial_guess, dtype=float),
+            precision=4,
+            separator=", ",
+        )
+        tolerance = config.eps if config.eps is not None else config.ivp_rtol
         return (
             f"#{index + 1} {record.request.task_name} "
-            f"[{record.request_id[:8]}] ({result.method}, "
+            f"[{record.request_id[:8]}/{record.request.problem_signature[:8]}] "
+            f"guess={guess} ({result.method}/{config.ivp_method}, "
+            f"tol={tolerance:.1e}, "
             f"‖Φ‖={result.residual_norm:.2e})"
         )
 
@@ -697,32 +705,32 @@ class IntegratedPlotWidget(QWidget):
         aux_set = set(self.aux_names)
         curves = []
         diagnostics: list[str] = []
-        for i, r in enumerate(self.all_results):
+        for i, record in enumerate(self.records):
             if i not in self._visible:
                 continue
             try:
-                sol = r["sol"]
-                t0, t1 = float(sol.t[0]), float(sol.t[-1])
-                td = np.linspace(t0, t1, 500)
-                if hasattr(sol, 'sol') and callable(sol.sol):
-                    yd = sol.sol(td)
-                else:
-                    yd = np.array([np.interp(td, sol.t, sol.y[j])
-                                   for j in range(len(self.var_names))])
+                td = record.primary_plot_t
+                yd = record.primary_plot_y
                 xd, xl = axis_data(x_axis, td, yd)
                 # 辅助变量数据
-                aux_data = r.get("aux", {})
+                aux_data = record.auxiliary_outputs
                 for y_name in y_axes:
                     if y_name in aux_set:
                         aux_vals = aux_data.get(y_name)
                         if aux_vals is None:
                             diagnostics.append(
-                                f"request {r['request_id']}: auxiliary {y_name!r} "
+                                f"request {record.request_id}: auxiliary {y_name!r} "
                                 "is unavailable"
                             )
                             continue
+                        aux_t = record.auxiliary_sample_t
+                        if x_axis == "t":
+                            aux_x = aux_t
+                        else:
+                            state_index = self.var_names.index(x_axis)
+                            aux_x = np.interp(aux_t, td, yd[state_index])
                         curves.append(
-                            (i, y_name, np.asarray(xd), np.asarray(aux_vals))
+                            (i, y_name, np.asarray(aux_x), np.asarray(aux_vals))
                         )
                     else:
                         yd_arr, yl = axis_data(y_name, td, yd)
@@ -731,7 +739,7 @@ class IntegratedPlotWidget(QWidget):
                         )
             except (KeyError, ValueError, TypeError, IndexError, AttributeError) as exc:
                 diagnostics.append(
-                    f"request {r.get('request_id', 'unknown')}: "
+                    f"request {record.request_id}: "
                     f"{type(exc).__name__}: {exc}"
                 )
 
