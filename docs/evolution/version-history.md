@@ -26,7 +26,7 @@ phase_history_preserved=true
 | Phase 8 | v2.7 | `b11dc1accc357364d40d461df9a848896ccff2e7` | 显式求解容差和尺度化边界验收 | 无 |
 | Phase 9 | v2.8 | `2b1c6d74e14bc7bfe80653f8a5ded805594dcc61` | 结构化运行元数据、统一导出契约和原子写入 | 无 |
 | Phase 10 | v2.9 | `7cea5d38f5fe25a169824654968dfc895b4f7b97` | 性能计数、可复现基准和冗余计算清理 | 无 |
-| Phase 11 | v2.10 | `2ac1a20bf337bffd816582d1670af096c9f87dc0` | 干净环境、跨平台 CI、GUI 回归和发布准备 | 无 |
+| Phase 11 | v2.10 | `2ac1a20bf337bffd816582d1670af096c9f87dc0` | 干净环境、跨平台 CI、GUI 回归和发布准备 | [Engineering report](../reports/v2.10/report-source.md) |
 
 `v1.0` 和 `v2.0` 同时出现在最早提交的 `CHANGELOG` 中，但该 Git 历史没有保留一个早于
 `a4ef249`、可单独代表 `v1.0` 的代码提交。因此 `v1.0` 必须保持 `git_commit=null`；不能为了
@@ -72,7 +72,8 @@ main_ci_run=https://github.com/wuy503797-collab/bvp/actions/runs/31310177928
 
 ## Recommended report snapshots
 
-以下版本发生了适合独立报告的重大变化。除已经归档的 `v2.0` 外，本次没有生成报告正文。
+以下版本发生了适合独立报告的重大变化。`v2.0` 课程报告与 `v2.10` 工程报告已经归档；其余
+版本当前只保留代码快照映射。
 
 ```text
 recommended_report_versions:
@@ -81,7 +82,7 @@ recommended_report_versions:
 - v2.5   # 汇总 v2.3–v2.5：Core API、GUI 生命周期与求解器迁移
 - v2.7   # 汇总 v2.6–v2.7：表达式安全与容差语义
 - v2.9   # 汇总 v2.8–v2.9：可观测性、导出与性能证据
-- v2.10  # 干净环境、跨平台 CI 与发布准备
+- v2.10  # 已有工程报告：可靠性、工程化、验证与发布准备
 ```
 
 ## Recommended tags (not executed)

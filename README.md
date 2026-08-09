@@ -414,13 +414,15 @@ CI 性能模式只验证数值等价、Jacobian、Phi 复用、变分 IVP 为零
 
 ```text
 phase_eleven_local_status=PASS
-release_readiness_status=PENDING_REMOTE_CI_AND_LICENSE
+remote_ci_status=PASS
+release_readiness_status=PENDING_LICENSE
 ```
 
-本地环境、两个独立干净环境、285 项测试和全部验证脚本已经通过。以上结论不等于
-GitHub Actions 已通过；只有该提交推送后，Windows、Ubuntu 范围依赖和 Ubuntu 精确依赖
-三个远端任务实际成功，才能记录远端 CI 通过。仓库尚无 `LICENSE`，这不是代码缺陷，
-但在许可证确定前不创建正式 release 或版本 tag，也不宣称他人已经获得复制、修改或分发许可。
+本地环境、两个独立干净环境、285 项测试和全部验证脚本已经通过。Phase 11 分支提交
+`2ac1a20` 与合并后 `main` 提交 `1413ba43` 的 GitHub Actions 已实际运行成功；Windows、
+Ubuntu 范围依赖和 Ubuntu 精确依赖三个远端任务均通过。仓库尚无 `LICENSE`，这不是代码
+缺陷，但在许可证确定前不创建正式 release 或版本 tag，也不宣称他人已经获得复制、修改或
+分发许可。
 
 本地完整性能脚本仍保留预热、重复中位数和 profile；CI 调用轻量确定性模式：
 

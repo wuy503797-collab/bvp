@@ -24,7 +24,7 @@
 | v2.7 | 2026-08 | 求解容差拆分与尺度化边界验收 | No report snapshot archived | [`b11dc1a`](https://github.com/wuy503797-collab/bvp/tree/b11dc1accc357364d40d461df9a848896ccff2e7) |
 | v2.8 | 2026-08 | 结构化运行元数据与统一原子导出 | No report snapshot archived | [`2b1c6d7`](https://github.com/wuy503797-collab/bvp/tree/2b1c6d74e14bc7bfe80653f8a5ded805594dcc61) |
 | v2.9 | 2026-08 | 性能计数、基准和无效计算清理 | No report snapshot archived | [`7cea5d3`](https://github.com/wuy503797-collab/bvp/tree/7cea5d38f5fe25a169824654968dfc895b4f7b97) |
-| v2.10 | 2026-08 | 干净环境、跨平台 CI、GUI 回归与发布准备 | No report snapshot archived | [`2ac1a20`](https://github.com/wuy503797-collab/bvp/tree/2ac1a20bf337bffd816582d1670af096c9f87dc0) |
+| v2.10 | 2026-08 | 干净环境、跨平台 CI、GUI 回归与发布准备 | [Engineering report](v2.10/report-source.md) | [`2ac1a20`](https://github.com/wuy503797-collab/bvp/tree/2ac1a20bf337bffd816582d1670af096c9f87dc0) |
 
 完整的版本、提交、内部 Phase 和分支保留策略见
 [version-history.md](../evolution/version-history.md)。机器可读映射见 [manifest.json](manifest.json)。
