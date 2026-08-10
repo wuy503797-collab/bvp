@@ -88,7 +88,9 @@ python -m pip install -r requirements-lock.txt
 python main.py
 ```
 
-程序启动后通过“加载”按钮选择仓库中的任务 JSON，例如 `task1.json` 或 `tasks.json`。
+程序启动后通过“加载”按钮选择任务 JSON。可以先加载单问题示例
+[`examples/tasks/26_1_two_body.json`](examples/tasks/26_1_two_body.json)，或包含 26.1–26.4 的教材任务库
+[`examples/tasks/textbook_problems.json`](examples/tasks/textbook_problems.json)。文件选择器仍允许加载用户自行保存的任意 JSON 文件。
 
 ### 后台求解与结果来源
 
@@ -591,11 +593,14 @@ scripts/check_repository_hygiene.py
 tests/core/                  核心 API、模型、安全、容差、性能和导出契约
 tests/gui/                   Qt 离屏请求、线程、关闭、绘图与警告回归
 tests/numerical/             解析解、制造解和容差敏感性
+examples/tasks/              GUI/API 用户可加载的教材和演示任务
+tests/fixtures/tasks/        自动化测试专用的故意无效、奇异或边界输入
 .github/workflows/ci.yml     Python 3.11 Windows/Linux 持续集成
 ```
 
 `solver.py` 是仍被 26.1 独立基线使用的兼容实现；它不是 `bvp_core` 求解器的第二份公共
-事实来源。`task_error_test.json` 属于负向测试数据，其余任务 JSON 是示例和兼容性夹具。
+事实来源。正常、可展示的任务只存放在 [`examples/tasks/`](examples/tasks/)；
+[`tests/fixtures/tasks/`](tests/fixtures/tasks/) 仅保存自动化测试故意使用的负向输入，不作为普通用户示例推荐。
 
 ## 已知限制与开发计划
 

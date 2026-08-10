@@ -20,18 +20,18 @@ from bvp_core.exceptions import ExpressionValidationError
 from bvp_core.expression_policy import ExpressionContext, parse_restricted_expression
 from bvp_core.expressions import SymPyParser
 from main import Dataset
-
-
-TASK_FILES = (
-    "tasks.json",
-    "task1.json",
-    "tasks2.json",
-    "tasks3.json",
-    "tasks4.json",
-    "task5.json",
-    "task_error_test.json",
+from task_asset_paths import (
+    EXAMPLE_TASK_FILES,
+    OVERDETERMINED_FIXTURE_PATH,
+    PROJECT_ROOT,
+    TASK_FIXTURE_FILES,
 )
-EXPECTED_MODEL_INVALID = {("tasks.json", 4)}
+
+
+TASK_FILES = (*EXAMPLE_TASK_FILES, *TASK_FIXTURE_FILES)
+EXPECTED_MODEL_INVALID = {
+    (OVERDETERMINED_FIXTURE_PATH, 0),
+}
 
 
 def _check_allowed_expressions() -> None:
@@ -89,8 +89,9 @@ def _check_blocked_expressions() -> None:
 
 
 def _check_task_library() -> None:
-    for filename in TASK_FILES:
-        raw_tasks = json.loads((REPO_ROOT / filename).read_text(encoding="utf-8"))
+    for task_path in TASK_FILES:
+        raw_tasks = json.loads(task_path.read_text(encoding="utf-8"))
+        relative_path = task_path.relative_to(PROJECT_ROOT).as_posix()
         for index, raw_task in enumerate(raw_tasks):
             dataset = Dataset.from_dict(raw_task)
             parser = SymPyParser(dataset.equations, dataset.var_names)
@@ -100,20 +101,20 @@ def _check_task_library() -> None:
             )
             parser.lambdify_aux(dataset.aux_outputs)
             model_errors = dataset.validate()
-            key = (filename, index)
+            key = (task_path, index)
             if key in EXPECTED_MODEL_INVALID:
                 if not any("boundary condition count" in error for error in model_errors):
                     raise AssertionError(
-                        f"{filename} task {index + 1}: expected dimension error"
+                        f"{relative_path} task {index + 1}: expected dimension error"
                     )
                 status = "PARSE_PASS_MODEL_INVALID_AS_EXPECTED"
             else:
                 if model_errors:
                     raise AssertionError(
-                        f"{filename} task {index + 1}: {model_errors}"
+                        f"{relative_path} task {index + 1}: {model_errors}"
                     )
                 status = "PASS"
-            print(f"task_parse_status={filename}#{index + 1}:{status}")
+            print(f"task_parse_status={relative_path}#{index + 1}:{status}")
 
 
 def main() -> int:

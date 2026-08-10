@@ -12,23 +12,27 @@ os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 from bvp_core.expressions import SymPyParser
 from main import Dataset
-
-
-REPO_ROOT = Path(__file__).resolve().parents[2]
-TASK_FILES = (
-    "tasks.json",
-    "task1.json",
-    "tasks2.json",
-    "tasks3.json",
-    "tasks4.json",
-    "task5.json",
-    "task_error_test.json",
+from task_asset_paths import (
+    EXAMPLE_TASK_FILES,
+    OVERDETERMINED_FIXTURE_PATH,
+    PROJECT_ROOT,
+    SINGULAR_IVP_FIXTURE_PATH,
+    TASK_FIXTURE_FILES,
 )
 
 
-@pytest.mark.parametrize("filename", TASK_FILES)
-def test_every_task_file_uses_the_restricted_expression_language(filename: str) -> None:
-    raw_tasks = json.loads((REPO_ROOT / filename).read_text(encoding="utf-8"))
+TASK_FILES = (*EXAMPLE_TASK_FILES, *TASK_FIXTURE_FILES)
+
+
+@pytest.mark.parametrize(
+    "task_path",
+    TASK_FILES,
+    ids=lambda path: path.relative_to(PROJECT_ROOT).as_posix(),
+)
+def test_every_task_file_uses_the_restricted_expression_language(
+    task_path: Path,
+) -> None:
+    raw_tasks = json.loads(task_path.read_text(encoding="utf-8"))
 
     for raw_task in raw_tasks:
         dataset = Dataset.from_dict(raw_task)
@@ -41,8 +45,10 @@ def test_every_task_file_uses_the_restricted_expression_language(filename: str) 
 
 
 def test_expression_security_does_not_hide_existing_model_validation_errors() -> None:
-    tasks = json.loads((REPO_ROOT / "tasks.json").read_text(encoding="utf-8"))
-    overdetermined = Dataset.from_dict(tasks[4])
+    raw_task = json.loads(
+        OVERDETERMINED_FIXTURE_PATH.read_text(encoding="utf-8")
+    )[0]
+    overdetermined = Dataset.from_dict(raw_task)
 
     errors = overdetermined.validate()
 
@@ -51,7 +57,7 @@ def test_expression_security_does_not_hide_existing_model_validation_errors() ->
 
 def test_numerically_bad_fixture_remains_syntactically_safe() -> None:
     raw_task = json.loads(
-        (REPO_ROOT / "task_error_test.json").read_text(encoding="utf-8")
+        SINGULAR_IVP_FIXTURE_PATH.read_text(encoding="utf-8")
     )[0]
 
     assert Dataset.from_dict(raw_task).validate() == []

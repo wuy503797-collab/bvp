@@ -1554,7 +1554,7 @@ class BvpSolverApp(QMainWindow):
     def _tasks_save_json(self):
         """Сохраняет все задачи в JSON-файл."""
         path, _ = QFileDialog.getSaveFileName(
-            self, "Сохранить задачи", "tasks.json", "JSON (*.json)"
+            self, "Сохранить задачи", "bvp_task_collection.json", "JSON (*.json)"
         )
         if not path:
             return

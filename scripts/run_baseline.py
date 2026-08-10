@@ -26,6 +26,7 @@ from scipy.integrate import solve_ivp
 
 from main import BVPSolver, Dataset, SymPyParser
 from solver import solve_example_26_1, two_body_dynamics
+from task_asset_paths import EXAMPLE_TASKS_DIR
 
 
 BOUNDARY_TOL = 1e-8
@@ -97,7 +98,9 @@ def run_standalone_two_body() -> dict[str, Any]:
 
 
 def run_main_continuation() -> dict[str, Any]:
-    task_data = json.loads((REPO_ROOT / "task1.json").read_text(encoding="utf-8"))[0]
+    task_data = json.loads(
+        (EXAMPLE_TASKS_DIR / "26_1_two_body.json").read_text(encoding="utf-8")
+    )[0]
     dataset = Dataset.from_dict(task_data)
     solver = _build_solver(dataset)
 

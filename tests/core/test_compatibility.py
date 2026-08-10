@@ -4,19 +4,17 @@ from __future__ import annotations
 
 import json
 import os
-from pathlib import Path
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 from bvp_core.adapters import config_from_dataset, dataset_kwargs, problem_from_dataset
 from main import Dataset
-
-
-REPO_ROOT = Path(__file__).resolve().parents[2]
-
+from task_asset_paths import EXAMPLE_TASKS_DIR
 
 def test_legacy_dataset_round_trip_preserves_problem_and_solver_controls() -> None:
-    task = json.loads((REPO_ROOT / "task1.json").read_text(encoding="utf-8"))[0]
+    task = json.loads(
+        (EXAMPLE_TASKS_DIR / "26_1_two_body.json").read_text(encoding="utf-8")
+    )[0]
     dataset = Dataset.from_dict(task)
 
     problem = problem_from_dataset(dataset)

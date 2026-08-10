@@ -1,6 +1,12 @@
 CHANGELOG
 =========
 
+Phase 13 repository maintenance (2026-08, no software version change)
+- 将用户可加载的教材任务迁移到 examples/tasks/，将故意无效或奇异的测试输入迁移到 tests/fixtures/tasks/
+- 把原综合任务库拆分为 26.1–26.4 教材示例和独立过定约束 fixture，保持所有任务数学内容逐字段等价
+- 更新基线、表达式兼容、负向测试、README、贡献规则与仓库卫生检查，并禁止历史根目录任务文件复活
+- project version 保持 v2.10；未修改数值算法、依赖、CI workflow、版本映射或冻结的 v2.10 报告
+
 v2.10 (2026-08)
 - 删除全局 Matplotlib 实验性 toolmanager 设置，保留 NavigationToolbar2QT，并将默认 pytest 警告清零
 - 修复同一任务不同数值输入被错误隔离的问题，覆盖初始猜测、方程/边界数值、已知初值、区间、方法、容差和延拓步数；冻结每次主曲线采样并支持 26.1 多解分支同时勾选和叠加

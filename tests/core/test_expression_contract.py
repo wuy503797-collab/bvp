@@ -3,17 +3,13 @@
 from __future__ import annotations
 
 import json
-from pathlib import Path
 
 import numpy as np
 import pytest
 
 from bvp_core.expressions import SymPyParser
 from bvp_core.exceptions import ExpressionValidationError
-
-
-REPO_ROOT = Path(__file__).resolve().parents[2]
-
+from task_asset_paths import TEXTBOOK_PROBLEMS_PATH
 
 def _parsed(equations: list[str], var_names: list[str]) -> SymPyParser:
     parser = SymPyParser(equations, var_names)
@@ -22,7 +18,7 @@ def _parsed(equations: list[str], var_names: list[str]) -> SymPyParser:
 
 
 def _task(number: str) -> dict:
-    tasks = json.loads((REPO_ROOT / "tasks.json").read_text(encoding="utf-8"))
+    tasks = json.loads(TEXTBOOK_PROBLEMS_PATH.read_text(encoding="utf-8"))
     return next(task for task in tasks if task["name"].startswith(number))
 
 
