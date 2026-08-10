@@ -114,13 +114,14 @@
     },
     {
       "version": "2.10",
-      "directory": null,
-      "title": "BVP Solver v2.10",
-      "report_type": null,
+      "directory": "v2.10",
+      "title": "BVP Solver v2.10 Technical Report",
+      "report_type": "engineering_report",
       "snapshot_status": "historical_snapshot",
       "git_commit": "2ac1a20bf337bffd816582d1670af096c9f87dc0",
       "git_tag": null,
-      "report_available": false
+      "report_available": true,
+      "report_file": "v2.10/report-source.md"
     }
   ]
 }

@@ -1,0 +1,16 @@
+{
+  "schema_version": "bvp-report-metadata-v1",
+  "project_version": "2.10",
+  "report_title": "BVP Solver v2.10 Technical Report",
+  "report_type": "engineering_report",
+  "snapshot_status": "historical_snapshot",
+  "git_commit": "2ac1a20",
+  "main_merge_commit": "1413ba43",
+  "git_tag": null,
+  "report_document_commit": "64622bd4b5c79753c1610510a2a70f731c933351",
+  "test_count": 285,
+  "local_validation_status": "PASS",
+  "remote_ci_status": "PASS",
+  "license_status": "license_decision_required",
+  "report_revision": 1
+}
