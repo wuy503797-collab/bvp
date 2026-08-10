@@ -28,6 +28,17 @@ ENVIRONMENT_PARTS = {"venv", ".venv"}
 CACHE_PARTS = {"__pycache__", ".pytest_cache", "htmlcov"}
 TEMPORARY_SUFFIXES = {".bak", ".orig", ".swp", ".swo", ".tmp", "~"}
 LARGE_FILE_BYTES = 1_000_000
+LEGACY_ROOT_TASK_FILENAMES = frozenset(
+    {
+        "tasks.json",
+        "task1.json",
+        "tasks2.json",
+        "tasks3.json",
+        "tasks4.json",
+        "task5.json",
+        "task_error_test.json",
+    }
+)
 README_LINK = re.compile(r"!?\[[^\]]*\]\(([^)]+)\)")
 LOCAL_WINDOWS_PATH = re.compile(r"(?<![A-Za-z0-9_])[A-Za-z]:[\\/]")
 LOCAL_POSIX_PATH = re.compile(r"/(?:Users|home)/[^/\s]+/")
@@ -226,6 +237,19 @@ def main(argv: list[str] | None = None) -> int:
         and (REPOSITORY / path).stat().st_size >= LARGE_FILE_BYTES
     ]
     retained_pdfs = sorted(path.name for path in REPOSITORY.glob("*.pdf"))
+    unexpected_root_task_assets = sorted(
+        name
+        for name in LEGACY_ROOT_TASK_FILENAMES
+        if (REPOSITORY / name).exists()
+    )
+    example_task_assets = sorted(
+        path.relative_to(REPOSITORY).as_posix()
+        for path in (REPOSITORY / "examples" / "tasks").glob("*.json")
+    )
+    task_fixtures = sorted(
+        path.relative_to(REPOSITORY).as_posix()
+        for path in (REPOSITORY / "tests" / "fixtures" / "tasks").glob("*.json")
+    )
     clean = _working_tree_clean()
 
     print(f"tracked_environment_files={len(tracked_environment)}")
@@ -238,16 +262,18 @@ def main(argv: list[str] | None = None) -> int:
     print(f"local_absolute_path_locations={len(local_paths)}")
     print(f"large_files={len(large_files)}")
     print(f"retained_pdf_materials={len(retained_pdfs)}")
+    print(f"example_task_assets={len(example_task_assets)}")
+    print(f"task_fixture_assets={len(task_fixtures)}")
+    print(f"unexpected_root_task_assets={len(unexpected_root_task_assets)}")
     print(f"working_tree_clean={clean}")
     print("legacy_file=gui.py classification=obsolete-placeholder pending-separate-cleanup")
     print("legacy_file=solver.py classification=compatibility active-26.1-baseline")
-    print("legacy_file=task1.json classification=example active-baseline")
-    print("legacy_file=tasks.json classification=example active-library")
-    print("legacy_file=tasks2.json classification=example compatibility-fixture")
-    print("legacy_file=tasks3.json classification=example compatibility-fixture")
-    print("legacy_file=tasks4.json classification=example compatibility-fixture")
-    print("legacy_file=task5.json classification=example compatibility-fixture")
-    print("legacy_file=task_error_test.json classification=negative-test-data")
+    for path in example_task_assets:
+        print(f"task_asset={path} classification=user-example")
+    for path in task_fixtures:
+        print(f"task_asset={path} classification=negative-test-fixture")
+    for name in unexpected_root_task_assets:
+        print(f"unexpected_root_task_asset={name}")
     for name in retained_pdfs:
         print(f"retained_material={name} classification=intentional-project-material")
     for path in broken_readme:
@@ -266,6 +292,7 @@ def main(argv: list[str] | None = None) -> int:
         not case_mismatches,
         not local_paths,
         not large_files,
+        not unexpected_root_task_assets,
         clean if arguments.require_clean_working_tree else True,
     )
     passed = all(checks)

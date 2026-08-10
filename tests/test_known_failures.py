@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import json
 import os
-from pathlib import Path
 
 import numpy as np
 import pytest
@@ -12,10 +11,7 @@ import pytest
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 from main import BVPSolver, Dataset, SymPyParser
-
-
-REPO_ROOT = Path(__file__).resolve().parents[1]
-
+from task_asset_paths import SINGULAR_IVP_FIXTURE_PATH
 
 def _build_solver(dataset: Dataset) -> BVPSolver:
     parser = SymPyParser(dataset.equations, dataset.var_names)
@@ -136,8 +132,7 @@ def test_validation_rejects_boundary_unknown_dimension_mismatch() -> None:
 
 
 def test_singular_ivp_returns_diagnostic_failure_result() -> None:
-    task_path = REPO_ROOT / "task_error_test.json"
-    task_data = json.loads(task_path.read_text(encoding="utf-8"))[0]
+    task_data = json.loads(SINGULAR_IVP_FIXTURE_PATH.read_text(encoding="utf-8"))[0]
     dataset = Dataset.from_dict(task_data)
     solver = _build_solver(dataset)
 
@@ -148,9 +143,9 @@ def test_singular_ivp_returns_diagnostic_failure_result() -> None:
     assert result["ivp_success"] is False
     assert result["boundary_success"] is False
     assert result["optimizer_success"] is False
-    assert result["ivp_status"] is not None
+    assert result["ivp_status"] == -1
     assert result["ivp_t_final"] is not None
-    assert result["ivp_t_final"] < dataset.T
+    assert result["ivp_t_final"] == pytest.approx(0.5, rel=0.0, abs=1e-6)
     assert "ivp" in message.lower() or "solve_ivp" in message.lower()
     assert "status" in message.lower()
     assert result["ivp_message"]

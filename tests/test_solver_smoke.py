@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import json
 import os
-from pathlib import Path
 
 import numpy as np
 
@@ -12,9 +11,8 @@ os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 from main import BVPSolver, Dataset, SymPyParser
 from solver import solve_example_26_1
+from task_asset_paths import EXAMPLE_TASKS_DIR
 
-
-REPO_ROOT = Path(__file__).resolve().parents[1]
 TARGET_POSITION = np.array([1.0738644361, -1.0995343576])
 BOUNDARY_TOL = 1e-8
 
@@ -49,7 +47,7 @@ def test_standalone_two_body_shooting_matches_terminal_boundary() -> None:
 
 
 def test_main_continuation_two_body_matches_independent_boundary_check() -> None:
-    task_path = REPO_ROOT / "task1.json"
+    task_path = EXAMPLE_TASKS_DIR / "26_1_two_body.json"
     task_data = json.loads(task_path.read_text(encoding="utf-8"))[0]
     dataset = Dataset.from_dict(task_data)
     parser = SymPyParser(dataset.equations, dataset.var_names)

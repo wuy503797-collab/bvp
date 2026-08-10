@@ -194,40 +194,5 @@
     ],
     "t_star": 0.0,
     "aux_outputs": {}
-  },
-  {
-    "name": "1",
-    "equations": [
-      "x1",
-      "-x0"
-    ],
-    "var_names": [
-      "x0",
-      "x1"
-    ],
-    "T": 6.28,
-    "initial_values": {
-      "0": 1.0,
-      "1": null
-    },
-    "boundary_conditions": [
-      "x0_T-1",
-      "x1_T"
-    ],
-    "guess": [
-      6.28
-    ],
-    "eps": 1e-08,
-    "method": "RK45",
-    "solver_method": "shooting",
-    "continuation_steps": 50,
-    "known_indices": [
-      0
-    ],
-    "unknown_indices": [
-      1
-    ],
-    "t_star": 0.0,
-    "aux_outputs": {}
   }
 ]
