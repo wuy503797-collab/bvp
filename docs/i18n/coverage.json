@@ -1,0 +1,31 @@
+{
+  "schema_version": "bvp-bilingual-coverage-v1",
+  "languages": ["zh-CN", "ru-RU"],
+  "current_documentation": {
+    "index": "docs/bilingual/README.md",
+    "pairs": [
+      {"key": "project-overview", "zh-CN": "docs/bilingual/project-overview.zh-CN.md", "ru-RU": "docs/bilingual/project-overview.ru.md"},
+      {"key": "numerical-methods", "zh-CN": "docs/bilingual/numerical-methods.zh-CN.md", "ru-RU": "docs/bilingual/numerical-methods.ru.md"},
+      {"key": "architecture", "zh-CN": "docs/bilingual/architecture.zh-CN.md", "ru-RU": "docs/bilingual/architecture.ru.md"},
+      {"key": "user-guide", "zh-CN": "docs/bilingual/user-guide.zh-CN.md", "ru-RU": "docs/bilingual/user-guide.ru.md"},
+      {"key": "task-guide", "zh-CN": "docs/bilingual/task-guide.zh-CN.md", "ru-RU": "docs/bilingual/task-guide.ru.md"},
+      {"key": "validation", "zh-CN": "docs/bilingual/validation.zh-CN.md", "ru-RU": "docs/bilingual/validation.ru.md"},
+      {"key": "testing", "zh-CN": "docs/bilingual/testing.zh-CN.md", "ru-RU": "docs/bilingual/testing.ru.md"}
+    ]
+  },
+  "root_readmes": {"zh-CN": "README.md", "ru-RU": "README.ru.md"},
+  "terminology": "docs/i18n/glossary.zh-ru.md",
+  "style_guide": "docs/i18n/style-guide.md",
+  "historical_translation": {
+    "source": "docs/reports/v2.10/report-source.md",
+    "ru-RU": "docs/translations/v2.10/report.ru.md",
+    "software_snapshot_commit": "2ac1a20",
+    "report_document_commit": "64622bd4b5c79753c1610510a2a70f731c933351",
+    "historical_test_count": 285
+  },
+  "current_test_count": 307,
+  "gui_language_audit": "partial_zh_ru_with_hardcoded_mixed_strings",
+  "gui_i18n_implemented_in_phase": false,
+  "project_version": "v2.10",
+  "software_version_changed": false
+}
