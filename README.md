@@ -1,5 +1,7 @@
 # BVP Solver — 通用常微分方程边值问题求解器 / Универсальный решатель краевых задач
 
+**语言 / Язык：** [简体中文（当前页）](README.md) · [Русский](README.ru.md) · [中俄双语技术文档](docs/bilingual/README.md)
+
 [![CI](https://github.com/wuy503797-collab/bvp/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/wuy503797-collab/bvp/actions/workflows/ci.yml)
 
 这是一个使用 Python、SciPy、SymPy、PyQt5 和 Matplotlib 开发的通用一阶常微分方程系统边值问题（Boundary Value Problem，BVP）教学与实验型求解器。程序提供打靶法和参数延拓法、PyQt5 GUI、无窗口 Python API、JSON 任务加载、交互绘图和原子结果导出。
@@ -365,7 +367,7 @@ python scripts/run_performance_validation.py
 python -m pytest -q
 ```
 
-当前测试集合为 285 项，默认运行目标为 0 warnings。此前唯一警告来自全局启用 Matplotlib
+当前测试集合为 307 项，默认运行目标为 0 warnings。此前唯一警告来自全局启用 Matplotlib
 实验性 `toolmanager`；绘图组件实际使用稳定的 `NavigationToolbar2QT`，因此已删除该全局
 设置，没有增加 warning ignore 或改变绘图入口。
 
@@ -420,7 +422,7 @@ remote_ci_status=PASS
 release_readiness_status=PENDING_LICENSE
 ```
 
-本地环境、两个独立干净环境、285 项测试和全部验证脚本已经通过。Phase 11 分支提交
+本地环境、两个独立干净环境、307 项测试和全部验证脚本已经通过。Phase 11 分支提交
 `2ac1a20` 与合并后 `main` 提交 `1413ba43` 的 GitHub Actions 已实际运行成功；Windows、
 Ubuntu 范围依赖和 Ubuntu 精确依赖三个远端任务均通过。仓库尚无 `LICENSE`，这不是代码
 缺陷，但在许可证确定前不创建正式 release 或版本 tag，也不宣称他人已经获得复制、修改或
@@ -439,8 +441,9 @@ python scripts/run_performance_validation.py --ci
 python scripts/check_repository_hygiene.py
 ```
 
-当前课程与项目报告 PDF 是用户有意保留但被 Git 忽略的项目材料；重复任务 JSON 和空
-`gui.py` 留待独立清理决策，不在 CI 阶段删除。贡献要求见
+当前课程与项目报告 PDF 是用户有意保留但被 Git 忽略的项目材料；空 `gui.py` 留待独立清理
+决策，不在 CI 阶段删除。教材任务和负向测试输入已分别放入 `examples/tasks/` 与
+`tests/fixtures/tasks/`。贡献要求见
 [CONTRIBUTING.md](CONTRIBUTING.md)，安全边界和报告方式见 [SECURITY.md](SECURITY.md)。
 
 仓库当前没有 `LICENSE`。这意味着许可证仍需仓库所有者在发布前决定；README 不据此
@@ -610,7 +613,7 @@ tests/fixtures/tasks/        自动化测试专用的故意无效、奇异或边
 - 协作式取消不能中断正在执行的单次 SciPy `solve_ivp`；
 - 精确参考文件没有锁定或哈希全部传递依赖；
 - GitHub 托管的 Windows/Linux 状态以真实 CI badge 和工作流记录为准；
-- 正式公开发布前仍需由仓库所有者决定许可证，并另行判断空 `gui.py` 和重复示例数据是否清理。
+- 正式公开发布前仍需由仓库所有者决定许可证，并另行判断空 `gui.py` 是否清理。
 
 后续迭代应优先依据 CI 和数值验证发现的问题推进，不因平台波动随意放宽既有数学门槛。
 
@@ -621,6 +624,15 @@ tests/fixtures/tasks/        自动化测试专用的故意无效、奇异或边
 
 - [查看版本化报告](docs/reports/README.md)
 - [查看 Version ↔ Commit ↔ Phase 演进](docs/evolution/version-history.md)
+
+## 中俄双语技术文档
+
+当前软件状态的中文与俄文技术讲解集中在
+[双语文档索引](docs/bilingual/README.md)。术语与翻译规则分别见
+[中俄术语表](docs/i18n/glossary.zh-ru.md)和[翻译风格指南](docs/i18n/style-guide.md)。
+历史 v2.10 报告的俄文译本位于
+[docs/translations/v2.10/report.ru.md](docs/translations/v2.10/report.ru.md)；它只翻译冻结快照，
+不代表新的软件版本或报告修订。
 
 ## 文档说明
 
