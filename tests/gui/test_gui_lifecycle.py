@@ -5,12 +5,13 @@ from __future__ import annotations
 import json
 import logging
 import os
+from pathlib import Path
 from threading import Event
 from types import SimpleNamespace
 
 import numpy as np
 import pytest
-from PyQt5.QtCore import QThread
+from PyQt5.QtCore import Qt, QThread
 from PyQt5.QtWidgets import QApplication, QMessageBox
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
@@ -158,6 +159,181 @@ def _complete(window: BvpSolverApp, request: SolveRequest) -> SolveRecord:
     )
     window._on_solve_done(request.request_id, outcome)
     return window.solve_records[-1]
+
+
+def test_solver_selector_exposes_three_stable_method_identifiers_and_tooltips(
+    window: BvpSolverApp,
+) -> None:
+    assert [window.combo_solver.itemData(index) for index in range(3)] == [
+        "shooting",
+        "continuation",
+        "differential_continuation",
+    ]
+
+    window.update_language("zh")
+    assert "离散 μ_k" in window.combo_solver.itemData(1, Qt.ToolTipRole)
+    assert "μ=0" in window.combo_solver.itemData(2, Qt.ToolTipRole)
+
+    window.update_language("ru")
+    assert "Newton-коррекцию" in window.combo_solver.itemData(1, Qt.ToolTipRole)
+    assert "μ=1" in window.combo_solver.itemData(2, Qt.ToolTipRole)
+
+
+@pytest.mark.parametrize(
+    ("method", "steps_enabled"),
+    [
+        ("shooting", False),
+        ("continuation", True),
+        ("differential_continuation", False),
+    ],
+)
+def test_only_discrete_continuation_enables_step_count(
+    window: BvpSolverApp, method: str, steps_enabled: bool
+) -> None:
+    window.combo_solver.setCurrentIndex(window.combo_solver.findData(method))
+    assert window.input_steps.isEnabled() is steps_enabled
+    assert window.label_steps.isEnabled() is steps_enabled
+
+
+def test_solver_selection_builds_request_with_exact_core_method_key(
+    window: BvpSolverApp,
+) -> None:
+    dataset = _dataset("GUI differential dispatch")
+    window.tasks = [dataset]
+    window._task_ids = ["gui-differential"]
+    window.current_task_idx = 0
+    window._sync_task_to_editor(dataset)
+
+    for method in ("shooting", "continuation", "differential_continuation"):
+        window.combo_solver.setCurrentIndex(window.combo_solver.findData(method))
+        request = window._build_solve_request()
+        assert request.config.method == method
+
+
+def test_old_continuation_dataset_keeps_discrete_method_mapping(
+    window: BvpSolverApp,
+) -> None:
+    dataset = _dataset("Legacy continuation")
+    dataset.solver_method = "continuation"
+    window._sync_task_to_editor(dataset)
+    assert window.combo_solver.currentData() == "continuation"
+    assert window.combo_solver.currentText() == "Дискретное продолжение"
+    assert window._sync_editor_to_dataset(dataset).solver_method == "continuation"
+
+
+def test_language_switch_preserves_differential_algorithm_key(
+    window: BvpSolverApp,
+) -> None:
+    window.combo_solver.setCurrentIndex(
+        window.combo_solver.findData("differential_continuation")
+    )
+    window.update_language("zh")
+    assert window.combo_solver.currentData() == "differential_continuation"
+    assert window.combo_solver.currentText() == "微分参数延拓"
+    window.update_language("ru")
+    assert window.combo_solver.currentData() == "differential_continuation"
+    assert window.combo_solver.currentText() == "Дифференциальное продолжение"
+
+
+def test_worker_dispatches_differential_method_through_public_core_api() -> None:
+    dataset = _dataset("Worker differential")
+    dataset.solver_method = "differential_continuation"
+    request = SolveRequest.create(
+        problem=problem_from_dataset(dataset),
+        config=config_from_dataset(dataset),
+        source_task_id="worker-differential",
+    )
+    worker = SolverWorker(request)
+    completed = []
+    worker.request_finished.connect(lambda _request_id, outcome: completed.append(outcome))
+
+    worker.run()
+
+    assert len(completed) == 1
+    assert completed[0].result.success is True
+    assert completed[0].result.method == "differential_continuation"
+    assert completed[0].result.solver_metadata["differential_continuation"][
+        "mu_reached_1"
+    ] is True
+
+
+def test_gui_26_1_discrete_and_differential_methods_pass_strict_acceptance(
+    window: BvpSolverApp,
+) -> None:
+    task_path = (
+        Path(__file__).resolve().parents[2]
+        / "examples"
+        / "tasks"
+        / "26_1_two_body.json"
+    )
+    dataset = Dataset.from_dict(json.loads(task_path.read_text(encoding="utf-8"))[0])
+    window.tasks = [dataset]
+    window._task_ids = ["gui-26-1"]
+    window.current_task_idx = 0
+    window._sync_task_to_editor(dataset)
+
+    residuals = {}
+    for method in ("continuation", "differential_continuation"):
+        window.combo_solver.setCurrentIndex(window.combo_solver.findData(method))
+        request = window._build_solve_request()
+        assert request.config.method == method
+        worker = SolverWorker(request)
+        outcomes = []
+        worker.request_finished.connect(
+            lambda _request_id, outcome: outcomes.append(outcome)
+        )
+        worker.run()
+        assert len(outcomes) == 1
+        result = outcomes[0].result
+        assert result.success and result.boundary_success
+        assert np.all(np.abs(result.boundary_residual) <= result.boundary_thresholds)
+        residuals[method] = result.boundary_residual_norm
+
+    assert residuals["continuation"] == pytest.approx(1.0192e-11, rel=5e-3)
+    assert residuals["differential_continuation"] == pytest.approx(
+        1.1810e-9, rel=5e-3
+    )
+
+
+def test_success_message_localizes_method_threshold_and_mu_diagnostics(
+    window: BvpSolverApp,
+) -> None:
+    data = _successful_result().to_dict()
+    data["method"] = "differential_continuation"
+    data["iterations"] = 74
+    data["boundary_thresholds"] = np.array([1e-8])
+    data["solver_metadata"] = {
+        **data["solver_metadata"],
+        "differential_continuation": {"rhs_evaluations": 74},
+    }
+    result = BVPResult.from_legacy_dict(data)
+
+    window.update_language("zh")
+    zh = window._format_success_message(result, np.array([1.0]))
+    assert "方法: 微分参数延拓" in zh
+    assert "边界阈值: [1.e-08]" in zh
+    assert "μ-RHS 调用次数: 74" in zh
+    assert "迭代次数" not in zh
+
+    window.update_language("ru")
+    ru = window._format_success_message(result, np.array([1.0]))
+    assert "Метод: Дифференциальное продолжение" in ru
+    assert "Порог краевой невязки: [1.e-08]" in ru
+    assert "Число вычислений правой части по μ: 74" in ru
+    assert "Итераций" not in ru
+
+
+def test_success_message_distinguishes_old_discrete_continuation(
+    window: BvpSolverApp,
+) -> None:
+    data = _successful_result().to_dict()
+    data["method"] = "continuation"
+    result = BVPResult.from_legacy_dict(data)
+    window.update_language("ru")
+    message = window._format_success_message(result, np.array([1.0]))
+    assert "Метод: Дискретное продолжение" in message
+    assert "Итераций:" in message
+    assert "Дифференциальное продолжение" not in message
 
 
 def test_request_snapshot_survives_original_dataset_mutation() -> None:

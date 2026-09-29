@@ -27,6 +27,7 @@ class SolverCounterSnapshot:
     newton_iterations: int = 0
     newton_updates: int = 0
     damping_trials: int = 0
+    differential_rhs_evaluations: int = 0
 
     def to_dict(self) -> dict[str, int]:
         return asdict(self)
@@ -52,6 +53,7 @@ class SolverCounters:
     newton_iterations: int = 0
     newton_updates: int = 0
     damping_trials: int = 0
+    differential_rhs_evaluations: int = 0
 
     def record_ivp_start(self, *, purpose: str) -> None:
         self.ivp_solves += 1

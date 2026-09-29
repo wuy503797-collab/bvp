@@ -15,7 +15,7 @@ from scipy.optimize import root
 
 from .exceptions import IVPIntegrationError
 from .expressions import SymPyParser
-from .models import BVPProblem, SolverConfig
+from .models import BVPProblem, BVPValidationError, SolverConfig
 from .observability import RunContext, emit_solver_event, solver_event_enabled
 from .performance import SolverCounters
 from .requests import SolveCancelled
@@ -559,17 +559,40 @@ class BVPSolver:
         self._check_cancelled()
         return residual
 
-    def _dPhi_dp(self, p: np.ndarray) -> np.ndarray:
-        """Evaluate the existing forward-difference Jacobian.
+    def _dPhi_dp(
+        self, p: np.ndarray, *, scheme: str = "forward", step: float | None = None
+    ) -> np.ndarray:
+        """Evaluate a finite-difference Jacobian (legacy default: forward).
 
         A solver-private, single-use base residual may be staged with its exact
         parameter snapshot. This keeps reuse local to one Newton iteration and
         prevents a residual from a previous parameter vector being cached by error.
         The perturbation direction and step are unchanged from the former primary
-        path; only the unused variational IVP has been removed.
+        path; only the unused variational IVP has been removed. Differential
+        continuation explicitly selects central differences to reduce drift
+        when integrating the parameter ODE without Newton corrections.
         """
         self._check_cancelled()
         parameters = np.asarray(p, dtype=float)
+        if scheme not in {"forward", "central"}:
+            raise ValueError(f"Unknown finite-difference scheme: {scheme}")
+        eps_jac = (
+            max(1e-7, self.tolerances.jacobian_relative_step)
+            if step is None else float(step)
+        )
+        if not np.isfinite(eps_jac) or eps_jac <= 0:
+            raise ValueError("Jacobian step must be positive and finite")
+        if scheme == "central":
+            self.counters.jacobian_evaluations += 1
+            jac_matrix = np.empty((len(self.ds.boundary_conditions), len(self.unknown)))
+            for j in range(len(self.unknown)):
+                self._check_cancelled()
+                plus, minus = parameters.copy(), parameters.copy()
+                plus[j] += eps_jac
+                minus[j] -= eps_jac
+                jac_matrix[:, j] = (self._Phi(plus) - self._Phi(minus)) / (2 * eps_jac)
+            return jac_matrix
+
         base = self._take_local_phi_base(parameters)
         if base is None:
             base = self._Phi(parameters)
@@ -577,7 +600,6 @@ class BVPSolver:
         self.counters.jacobian_evaluations += 1
         k = len(self.unknown)
         m = len(base)
-        eps_jac = max(1e-7, self.tolerances.jacobian_relative_step)
         jac_matrix = np.zeros((m, k))
         for j in range(k):
             self._check_cancelled()
@@ -1111,6 +1133,313 @@ class BVPSolver:
                 callback("continuation", 100, f"Отклонено: {result['message']}")
         return result
 
+    # ------------------------------------------------------------------
+    # 3.3 Метод дифференциального продолжения по параметру
+    # ------------------------------------------------------------------
+
+    def differential_continuation_rhs(
+        self,
+        mu: float,
+        p: np.ndarray,
+        phi_p0: np.ndarray,
+        *,
+        jacobian_step: float = 1e-5,
+        max_jacobian_condition: float = 1e12,
+    ) -> np.ndarray:
+        """Правая часть μ-ОДУ:  dp/dμ = -[Φ'(p)]^{-1} Φ(p₀).
+
+        Обязанность функции единственна: по текущему μ и p
+          1) вычислить J = Φ'(p) (через существующую конечно-разностную
+             матрицу Якоби),
+          2) решить линейную систему  J · dp_dμ = -Φ(p₀)  без явного
+             обращения матрицы,
+          3) вернуть dp_dμ.
+
+        Фиксированный вектор Φ(p₀) передаётся извне и НИКОГДА не
+        пересчитывается внутри правой части.
+        """
+        self._check_cancelled()
+        self.counters.differential_rhs_evaluations += 1
+        parameters = np.asarray(p, dtype=float)
+        jacobian = self._dPhi_dp(parameters, scheme="central", step=jacobian_step)
+        right_hand_side = -np.asarray(phi_p0, dtype=float)
+        if (
+            jacobian.shape != (parameters.size, parameters.size)
+            or right_hand_side.shape != parameters.shape
+            or not np.isfinite(jacobian).all()
+            or not np.isfinite(right_hand_side).all()
+        ):
+            raise ValueError(
+                "differential continuation Jacobian/RHS has invalid shape or nonfinite values"
+            )
+        condition = float(np.linalg.cond(jacobian))
+        if not np.isfinite(condition) or condition > max_jacobian_condition:
+            raise np.linalg.LinAlgError(
+                f"Differential continuation Jacobian is singular or ill-conditioned: "
+                f"condition={condition:.6e}, limit={max_jacobian_condition:.6e}"
+            )
+        dp_dmu = np_solve(jacobian, right_hand_side)
+        if not np.isfinite(dp_dmu).all():
+            raise ValueError(
+                "differential continuation RHS produced NaN or Inf"
+            )
+        return dp_dmu
+
+    def solve_differential_continuation(
+        self,
+        callback: Optional[Callable] = None,
+        *,
+        p0: Optional[np.ndarray] = None,
+        mu_method: str = "RK45",
+        mu_rtol: float = 1e-10,
+        mu_atol: float = 1e-12,
+        jacobian_step: float = 1e-5,
+        max_jacobian_condition: float = 1e12,
+    ) -> dict:
+        """Метод дифференциального продолжения по параметру.
+
+        Гомотопия  Φ(p(μ)) = (1-μ)·Φ(p₀)  дифференцируется по μ:
+
+            Φ'(p(μ)) · dp/dμ = -Φ(p₀)
+            dp/dμ = -[Φ'(p)]^{-1} Φ(p₀),   p(0) = p₀,   μ ∈ [0, 1].
+
+        Правая часть интегрируется численно (solve_ivp) по μ от 0 до 1.
+        Полученное p(1) затем независимо перепроверяется исходной краевой
+        задачей: исходное состояние повторно интегрируется, заново
+        вычисляется Φ(p(1)), и применяется строгий критерий приёмки.
+        Успех μ-ОДУ учитывается только как algorithm diagnostics.
+        """
+        self._check_cancelled()
+        if p0 is None:
+            p0 = np.array(self.ds.guess, dtype=float).copy()
+        else:
+            p0 = np.asarray(p0, dtype=float).copy()
+
+        if p0.shape != (len(self.unknown),) or not np.isfinite(p0).all():
+            raise BVPValidationError("Differential p0 must be a finite unknown-parameter vector")
+        if mu_method not in {"RK23", "RK45", "DOP853", "Radau", "BDF", "LSODA"}:
+            raise BVPValidationError(f"Unsupported mu integration method: {mu_method}")
+        for name, value in (("mu_rtol", mu_rtol), ("mu_atol", mu_atol),
+                            ("jacobian_step", jacobian_step),
+                            ("max_jacobian_condition", max_jacobian_condition)):
+            if not np.isfinite(value) or value <= 0:
+                raise BVPValidationError(f"{name} must be positive and finite")
+        if max_jacobian_condition < 1:
+            raise BVPValidationError("max_jacobian_condition must be at least 1")
+        rhs_count_start = self.counters.differential_rhs_evaluations
+
+        solver_metadata: Dict[str, Any] = {
+            "differential_continuation": {
+                "mu_method": mu_method,
+                "mu_rtol": float(mu_rtol),
+                "mu_atol": float(mu_atol),
+                "jacobian_scheme": "central",
+                "jacobian_step": float(jacobian_step),
+                "max_jacobian_condition": float(max_jacobian_condition),
+                "state_ivp_method": self.ds.method,
+                "state_ivp_rtol": self.tolerances.ivp_rtol,
+                "state_ivp_atol": self.tolerances.ivp_atol,
+                "rhs_evaluations": 0,
+                "mu_reached_1": False,
+                "mu_solver_success": False,
+                "p0": p0.tolist(),
+            }
+        }
+
+        # Φ(p₀) вычисляется ОДИН раз до интегрирования и фиксируется.
+        try:
+            phi_p0 = self._Phi(p0)
+        except IVPIntegrationError as exc:
+            return self._build_ivp_failure_result(
+                p=p0,
+                method="differential_continuation",
+                error=exc,
+                optimizer_success=False,
+                iterations=0,
+                solver_metadata=solver_metadata,
+            )
+
+        phi_p0_norm = float(norm(phi_p0))
+        solver_metadata["differential_continuation"]["phi_p0"] = phi_p0.tolist()
+        solver_metadata["differential_continuation"]["phi_p0_norm"] = phi_p0_norm
+
+        if callback:
+            callback(
+                "differential_continuation",
+                0,
+                f"Начало дифференциального продолжения: "
+                f"‖Φ(p₀)‖={phi_p0_norm:.4e}",
+            )
+
+        if not np.isfinite(phi_p0).all():
+            return self._validate_final_candidate(
+                p=p0,
+                optimizer_success=False,
+                algorithm_success=False,
+                method="differential_continuation",
+                iterations=0,
+                solver_metadata=solver_metadata,
+                failure_status="non_finite_result",
+                failure_message=(
+                    "Initial differential continuation residual contains NaN or Inf."
+                ),
+            )
+
+        # Ранний выход: p₀ уже удовлетворяет граничным условиям.
+        initial_boundary_check = evaluate_boundary_acceptance(
+            phi_p0,
+            boundary_atol=self.tolerances.boundary_atol,
+            boundary_rtol=self.tolerances.boundary_rtol,
+            boundary_scales=self.tolerances.boundary_scales,
+        )
+        if initial_boundary_check.success:
+            solver_metadata["differential_continuation"]["mu_reached_1"] = True
+            solver_metadata["differential_continuation"]["mu_solver_success"] = True
+            solver_metadata["differential_continuation"]["p1"] = p0.tolist()
+            solver_metadata["differential_continuation"]["integration_skipped"] = True
+            solver_metadata["differential_continuation"]["mu_t_final"] = 1.0
+            solver_metadata["differential_continuation"]["trajectory"] = {
+                "mu": [0.0, 1.0],
+                "p": [[float(value), float(value)] for value in p0],
+            }
+            result = self._validate_final_candidate(
+                p=p0,
+                optimizer_success=True,
+                algorithm_success=True,
+                method="differential_continuation",
+                iterations=0,
+                solver_metadata=solver_metadata,
+            )
+            result["solver_metadata"]["differential_continuation"]["phi_p1_norm"] = (
+                result["boundary_residual_norm"]
+            )
+            return result
+
+        def mu_rhs(mu: float, p: np.ndarray) -> np.ndarray:
+            return self.differential_continuation_rhs(
+                mu, p, phi_p0, jacobian_step=jacobian_step,
+                max_jacobian_condition=max_jacobian_condition,
+            )
+
+        self._check_cancelled()
+        mu_solver_success = False
+        mu_reached_1 = False
+        p_final = p0.copy()
+        mu_t_values = np.array([], dtype=float)
+        mu_y_values = np.empty((len(p0), 0), dtype=float)
+        mu_failure_message: Optional[str] = None
+        mu_sol = None
+        try:
+            mu_sol = solve_ivp(
+                mu_rhs,
+                [0.0, 1.0],
+                p0,
+                method=mu_method,
+                dense_output=True,
+                rtol=mu_rtol,
+                atol=mu_atol,
+            )
+            self._check_cancelled()
+            mu_solver_success = bool(mu_sol.success)
+            mu_t_values = np.asarray(mu_sol.t, dtype=float)
+            mu_y_values = np.asarray(mu_sol.y, dtype=float)
+            mu_t_final = float(mu_t_values[-1]) if mu_t_values.size else None
+            mu_reached_1 = bool(
+                mu_t_values.size
+                and mu_t_final is not None
+                and np.isclose(mu_t_final, 1.0, rtol=0.0, atol=1e-12)
+            )
+            if mu_y_values.ndim == 2 and mu_y_values.shape[1]:
+                p_final = np.asarray(mu_sol.y[:, -1], dtype=float)
+            if mu_solver_success and mu_reached_1:
+                if getattr(mu_sol, "sol", None) is not None:
+                    p_final = np.asarray(
+                        mu_sol.sol(1.0), dtype=float
+                    ).reshape(-1)
+        except SolveCancelled:
+            raise
+        except (IVPIntegrationError, np.linalg.LinAlgError, ValueError, FloatingPointError) as exc:
+            mu_failure_message = (
+                f"μ-ODE solve_ivp raised {type(exc).__name__}: {exc}"
+            )
+            solver_metadata["differential_continuation"]["failure_type"] = type(exc).__name__
+
+        dc = solver_metadata["differential_continuation"]
+        dc["integration_skipped"] = False
+        dc["rhs_evaluations"] = self.counters.differential_rhs_evaluations - rhs_count_start
+        dc["mu_status"] = getattr(mu_sol, "status", None)
+        dc["mu_message"] = str(getattr(mu_sol, "message", mu_failure_message or ""))
+
+        solver_metadata["differential_continuation"]["mu_solver_success"] = (
+            mu_solver_success
+        )
+        solver_metadata["differential_continuation"]["mu_reached_1"] = mu_reached_1
+        solver_metadata["differential_continuation"]["mu_t_final"] = (
+            float(mu_t_values[-1]) if mu_t_values.size else None
+        )
+        solver_metadata["differential_continuation"]["p1"] = p_final.tolist()
+
+        # Траектория p(μ) для построения графика и диагностики.
+        if mu_solver_success and mu_reached_1 and getattr(mu_sol, "sol", None) is not None:
+            mu_grid = np.linspace(0.0, 1.0, 201)
+            p_trajectory = np.asarray(mu_sol.sol(mu_grid), dtype=float)
+            solver_metadata["differential_continuation"]["trajectory"] = {
+                "mu": mu_grid.tolist(),
+                "p": [p_trajectory[i].tolist() for i in range(p_trajectory.shape[0])],
+            }
+        else:
+            solver_metadata["differential_continuation"]["trajectory"] = {
+                "mu": mu_t_values.tolist(),
+                "p": [mu_y_values[i].tolist() for i in range(mu_y_values.shape[0])],
+            }
+
+        algorithm_success = bool(
+            mu_solver_success
+            and mu_reached_1
+            and np.isfinite(p_final).all()
+            and np.isfinite(mu_y_values).all()
+            and np.isfinite(np.asarray(dc["trajectory"]["p"])).all()
+        )
+        failure_status: Optional[str] = None
+        failure_message: Optional[str] = None
+        if not algorithm_success:
+            failure_status = "differential_continuation_failed"
+            failure_message = (
+                mu_failure_message
+                or "μ-ODE integration did not reach μ=1 successfully."
+            )
+
+        self._check_cancelled()
+        result = self._validate_final_candidate(
+            p=p_final,
+            optimizer_success=algorithm_success,
+            algorithm_success=algorithm_success,
+            method="differential_continuation",
+            iterations=int(dc["rhs_evaluations"]),
+            solver_metadata=solver_metadata,
+            failure_status=failure_status,
+            failure_message=failure_message,
+        )
+        result["solver_metadata"]["differential_continuation"]["phi_p1_norm"] = (
+            result["boundary_residual_norm"]
+        )
+
+        if callback:
+            if result["success"]:
+                callback(
+                    "differential_continuation",
+                    100,
+                    f"Готово! μ-RHS: {self.counters.differential_rhs_evaluations}, "
+                    f"‖Φ(p₁)‖={result['boundary_residual_norm']:.4e}",
+                )
+            else:
+                callback(
+                    "differential_continuation",
+                    100,
+                    f"Отклонено: {result['message']}",
+                )
+        return result
+
     def solve(self, callback: Optional[Callable] = None) -> dict:
         """Dispatch to the method selected by the immutable core configuration."""
         started = time.perf_counter()
@@ -1123,6 +1452,8 @@ class BVPSolver:
 
             if self.ds.solver_method == "shooting":
                 result = self.solve_shooting(callback)
+            elif self.ds.solver_method == "differential_continuation":
+                result = self.solve_differential_continuation(callback)
             else:
                 result = self.solve_continuation(callback)
             return result

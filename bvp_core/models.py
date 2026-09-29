@@ -326,9 +326,10 @@ class SolverConfig:
 
     def validation_errors(self) -> list[str]:
         errors: list[str] = []
-        if self.method not in {"shooting", "continuation"}:
+        if self.method not in {"shooting", "continuation", "differential_continuation"}:
             errors.append(
-                "Input validation: solver method must be 'shooting' or 'continuation'"
+                "Input validation: solver method must be 'shooting', 'continuation' "
+                "or 'differential_continuation'"
             )
         if self.ivp_method not in {
             "RK23",

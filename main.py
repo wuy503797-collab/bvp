@@ -1115,10 +1115,14 @@ class BvpSolverApp(QMainWindow):
             "param_eps": "精度 eps:",
             "param_method": "积分方法:",
             "param_solver": "求解方法:",
-            "param_steps": "延续步数:",
+            "param_steps": "离散延拓步数:",
             # 求解方法选项
-            "solver_cont": "参数延续 / Continuation",
-            "solver_shoot": "打靶法 / Shooting",
+            "solver_shoot": "打靶法",
+            "solver_cont": "离散参数延拓",
+            "solver_diff": "微分参数延拓",
+            "solver_shoot_tip": "直接求解边界残差方程。",
+            "solver_cont_tip": "在离散 μ_k 上进行 Newton 校正。",
+            "solver_diff_tip": "对参数轨迹 p(μ) 建立初值问题，并从 μ=0 积分到 μ=1。",
             # 状态
             "status_ready": "就绪",
             "status_solving": "正在求解...",
@@ -1130,10 +1134,13 @@ class BvpSolverApp(QMainWindow):
             "err_no_solution": "无可用的解，请先求解。",
             "confirm_clear": "确定要清空结果历史和绘图吗?",
             "solve_success": "求解成功!\n\n方法: {method}\n"
-                             "迭代次数: {iter}\n"
+                             "{iteration_line}"
                              "残差范数: {res_norm:.4e}\n"
+                             "边界阈值: {thresholds}\n"
                              "完整状态 x(0): {full_state}\n"
                              "未知参数: {p_opt}",
+            "mu_rhs_evaluations": "μ-RHS 调用次数: {count}",
+            "iteration_count": "迭代次数: {count}\n",
         },
         "ru": {
             "window_title": "Универсальный решатель BVP",
@@ -1204,9 +1211,13 @@ class BvpSolverApp(QMainWindow):
             "param_eps": "Точность eps:",
             "param_method": "Метод интегрирования:",
             "param_solver": "Метод решения:",
-            "param_steps": "Шаги продолжения:",
-            "solver_cont": "Продолжение / Continuation",
-            "solver_shoot": "Стрельба / Shooting",
+            "param_steps": "Шаги дискретного продолжения:",
+            "solver_shoot": "Метод стрельбы",
+            "solver_cont": "Дискретное продолжение",
+            "solver_diff": "Дифференциальное продолжение",
+            "solver_shoot_tip": "Непосредственно решает систему краевых невязок.",
+            "solver_cont_tip": "Использует дискретные значения μ_k и Newton-коррекцию.",
+            "solver_diff_tip": "Интегрирует дифференциальную систему для траектории p(μ) от μ=0 до μ=1.",
             "status_ready": "Готово",
             "status_solving": "Решаю...",
             "status_cancel_requested": "Отмена запрошена...",
@@ -1217,10 +1228,13 @@ class BvpSolverApp(QMainWindow):
             "err_no_solution": "Нет решения. Сначала нажмите 'Решить'.",
             "confirm_clear": "Очистить историю результатов и график?",
             "solve_success": "Решение найдено!\n\nМетод: {method}\n"
-                             "Итераций: {iter}\n"
+                             "{iteration_line}"
                              "‖Φ‖: {res_norm:.4e}\n"
+                             "Порог краевой невязки: {thresholds}\n"
                              "x(0)  = {full_state}\n"
                              "p_opt = {p_opt}",
+            "mu_rhs_evaluations": "Число вычислений правой части по μ: {count}",
+            "iteration_count": "Итераций: {count}\n",
         }
     }
 
@@ -1697,8 +1711,10 @@ class BvpSolverApp(QMainWindow):
         row += 1
         self.label_solver = QLabel()
         self.combo_solver = QComboBox()
-        self.combo_solver.addItem("Продолжение / Continuation", "continuation")
-        self.combo_solver.addItem("Стрельба / Shooting", "shooting")
+        self._populate_solver_selector("continuation")
+        self.combo_solver.currentIndexChanged.connect(
+            self._update_solver_method_controls
+        )
         params_grid.addWidget(self.label_solver, row, 0)
         params_grid.addWidget(self.combo_solver, row, 1)
 
@@ -1709,6 +1725,7 @@ class BvpSolverApp(QMainWindow):
         self.input_steps.setValue(50)
         params_grid.addWidget(self.label_steps, row, 0)
         params_grid.addWidget(self.input_steps, row, 1)
+        self._update_solver_method_controls()
 
         right_layout.addWidget(self.group_params)
 
@@ -1882,6 +1899,77 @@ class BvpSolverApp(QMainWindow):
         else:
             ds = copy.deepcopy(self.tasks[self.current_task_idx])
         return self._sync_editor_to_dataset(ds)
+
+    def _solver_method_label(self, method: str) -> str:
+        """Return the localized label for one stable core method identifier."""
+        translation_key = {
+            "shooting": "solver_shoot",
+            "continuation": "solver_cont",
+            "differential_continuation": "solver_diff",
+        }.get(method)
+        if translation_key is None:
+            return method
+        return self.TRANSLATIONS[self.current_lang][translation_key]
+
+    def _populate_solver_selector(self, selected_method: Optional[str] = None) -> None:
+        """Populate display labels while keeping core identifiers as item data."""
+        t = self.TRANSLATIONS[self.current_lang]
+        selected_method = selected_method or self.combo_solver.currentData()
+        self.combo_solver.blockSignals(True)
+        self.combo_solver.clear()
+        for label_key, tooltip_key, method in (
+            ("solver_shoot", "solver_shoot_tip", "shooting"),
+            ("solver_cont", "solver_cont_tip", "continuation"),
+            ("solver_diff", "solver_diff_tip", "differential_continuation"),
+        ):
+            self.combo_solver.addItem(t[label_key], method)
+            self.combo_solver.setItemData(
+                self.combo_solver.count() - 1, t[tooltip_key], Qt.ToolTipRole
+            )
+        index = self.combo_solver.findData(selected_method)
+        self.combo_solver.setCurrentIndex(index if index >= 0 else 0)
+        self.combo_solver.blockSignals(False)
+        self._update_solver_method_controls()
+
+    def _update_solver_method_controls(self, *_args) -> None:
+        """Disable the discrete step count when the selected method ignores it."""
+        if not hasattr(self, "input_steps"):
+            return
+        uses_discrete_steps = self.combo_solver.currentData() == "continuation"
+        self.label_steps.setEnabled(uses_discrete_steps)
+        self.input_steps.setEnabled(uses_discrete_steps)
+
+    def _format_success_message(self, result: BVPResult, full_state: np.ndarray) -> str:
+        """Format one localized, acceptance-backed GUI result summary."""
+        p_opt_str = np.array2string(result.p_opt, precision=6, separator=", ")
+        full_str = np.array2string(full_state, precision=6, separator=", ")
+        thresholds = np.array2string(
+            result.boundary_thresholds, precision=4, separator=", "
+        )
+        t = self.TRANSLATIONS[self.current_lang]
+        iteration_line = (
+            ""
+            if result.method == "differential_continuation"
+            else t["iteration_count"].format(count=result.iterations)
+        )
+        message = t["solve_success"].format(
+            method=self._solver_method_label(result.method),
+            iteration_line=iteration_line,
+            res_norm=result.residual_norm,
+            thresholds=thresholds,
+            p_opt=p_opt_str,
+            full_state=full_str,
+        )
+        if result.method == "differential_continuation":
+            diagnostics = result.solver_metadata.get(
+                "differential_continuation", {}
+            )
+            rhs_evaluations = diagnostics.get("rhs_evaluations")
+            if rhs_evaluations is not None:
+                message += "\n" + t["mu_rhs_evaluations"].format(
+                    count=rhs_evaluations
+                )
+        return message
 
     def _on_equations_changed(self):
         """Обновляет guess-подсказку при изменении уравнений."""
@@ -2209,15 +2297,7 @@ class BvpSolverApp(QMainWindow):
 
         result = outcome.result
         full_state = outcome.request.build_initial_state(result.p_opt)
-        full_str = np.array2string(full_state, precision=6, separator=", ")
-        p_opt_str = np.array2string(result.p_opt, precision=6, separator=", ")
-        message = self.TRANSLATIONS[self.current_lang]["solve_success"].format(
-            method=result.method,
-            iter=result.iterations,
-            res_norm=result.residual_norm,
-            p_opt=p_opt_str,
-            full_state=full_str,
-        )
+        message = self._format_success_message(result, full_state)
         mode = result.solver_metadata.get("tolerance_mode", "unknown")
         run_id_short = (
             result.run_metadata.run_id[:8] if result.run_metadata else "unknown"
@@ -2913,14 +2993,9 @@ class BvpSolverApp(QMainWindow):
         self.label_solver.setText(t["param_solver"])
         self.label_steps.setText(t["param_steps"])
 
-        # Обновляем тексты в combo_solver
+        # Обновляем тексты в combo_solver, сохраняя внутренний method key.
         current_data = self.combo_solver.currentData()
-        self.combo_solver.clear()
-        self.combo_solver.addItem(t["solver_cont"], "continuation")
-        self.combo_solver.addItem(t["solver_shoot"], "shooting")
-        idx = self.combo_solver.findData(current_data)
-        if idx >= 0:
-            self.combo_solver.setCurrentIndex(idx)
+        self._populate_solver_selector(current_data)
 
         # ---- Progress ----
         self.group_progress.setTitle(t["progress_title"])
