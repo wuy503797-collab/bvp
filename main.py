@@ -32,6 +32,7 @@ import time
 import traceback
 import warnings
 from dataclasses import dataclass, field, asdict
+from collections.abc import Mapping
 from typing import List, Callable, Optional, Tuple, Dict, Any
 from uuid import uuid4
 
@@ -40,6 +41,7 @@ import numpy as np
 import matplotlib
 matplotlib.use("Qt5Agg")
 import matplotlib.pyplot as plt
+from matplotlib import font_manager
 from matplotlib.backends.backend_qt5agg import FigureCanvasQTAgg as FigureCanvas
 from matplotlib.backends.backend_qt5agg import NavigationToolbar2QT as NavigationToolbar
 
@@ -405,6 +407,12 @@ class IntegratedPlotWidget(QWidget):
     TRANSLATIONS = {
         "zh": {
             "plot_controls": "绘图控制",
+            "plot_type": "图类型:",
+            "state_plot": "状态解 x(t)",
+            "parameter_plot": "延拓参数 p(μ)",
+            "parameter_title": "微分参数延拓：p(μ)",
+            "parameter_x_axis": "延拓参数 μ",
+            "parameter_y_axis": "参数向量 p(μ) 的分量",
             "x_axis": "X 轴:",
             "y_axes": "Y 轴:",
             "line_width": "线宽:",
@@ -419,6 +427,12 @@ class IntegratedPlotWidget(QWidget):
         },
         "ru": {
             "plot_controls": "Управление графиком",
+            "plot_type": "Тип графика:",
+            "state_plot": "Решение x(t)",
+            "parameter_plot": "Параметры p(μ)",
+            "parameter_title": "Дифференциальное продолжение: p(μ)",
+            "parameter_x_axis": "Параметр продолжения μ",
+            "parameter_y_axis": "Компоненты вектора p(μ)",
             "x_axis": "Ось X:",
             "y_axes": "Оси Y:",
             "line_width": "Толщина:",
@@ -488,6 +502,72 @@ class IntegratedPlotWidget(QWidget):
             f"‖Φ‖={result.residual_norm:.2e})"
         )
 
+    @staticmethod
+    def _parameter_trajectory(record: SolveRecord):
+        """Return a defensive copy of an accepted differential μ-trajectory."""
+        if not record.result.success or record.result.method != "differential_continuation":
+            return None
+        details = record.result.solver_metadata.get("differential_continuation")
+        if not isinstance(details, Mapping):
+            return None
+        if details.get("integration_skipped") is True:
+            return None
+        trajectory = details.get("trajectory")
+        if not isinstance(trajectory, Mapping):
+            return None
+        try:
+            mu = np.array(trajectory["mu"], dtype=float, copy=True)
+            parameters = np.array(trajectory["p"], dtype=float, copy=True)
+        except (KeyError, TypeError, ValueError):
+            return None
+        if (
+            mu.ndim != 1 or mu.size < 3
+            or parameters.ndim != 2
+            or parameters.shape != (len(record.request.problem.unknown_indices), mu.size)
+            or not np.isfinite(mu).all()
+            or not np.isfinite(parameters).all()
+            or not np.isclose(mu[0], 0.0, rtol=0, atol=1e-12)
+            or not np.isclose(mu[-1], 1.0, rtol=0, atol=1e-12)
+            or not np.all(np.diff(mu) > 0)
+        ):
+            return None
+        # Core metadata is parameter-major (k, N); expose a GUI-local,
+        # sample-major copy (N, k) for plotting each p_j(mu).
+        return mu, parameters.T.copy()
+
+    @staticmethod
+    def _parameter_labels(record: SolveRecord, count: int) -> list[str]:
+        subscripts = str.maketrans("0123456789", "₀₁₂₃₄₅₆₇₈₉")
+        labels = [f"p{str(i + 1).translate(subscripts)}(μ)" for i in range(count)]
+        if (
+            count == 2
+            and tuple(record.request.var_names) == ("x", "y", "vx", "vy")
+            and tuple(record.request.problem.unknown_indices) == (2, 3)
+        ):
+            return ["p₁(μ) = vₓ(0)", "p₂(μ) = vᵧ(0)"]
+        return labels
+
+    def _update_plot_type_choices(self) -> None:
+        available = any(self._parameter_trajectory(record) is not None for record in self.records)
+        previous = self.combo_plot_type.currentData()
+        self.combo_plot_type.blockSignals(True)
+        self.combo_plot_type.clear()
+        self.combo_plot_type.addItem(self._t("state_plot"), "state")
+        if available:
+            self.combo_plot_type.addItem(self._t("parameter_plot"), "parameter")
+        if previous == "parameter" and available:
+            self.combo_plot_type.setCurrentIndex(1)
+        self.combo_plot_type.blockSignals(False)
+        self._label_plot_type.setVisible(available)
+        self.combo_plot_type.setVisible(available)
+        self._on_plot_type_changed()
+
+    def _on_plot_type_changed(self) -> None:
+        state_plot = self.combo_plot_type.currentData() != "parameter"
+        for control in (self.combo_x, self.y_list, self.check_markers, self.check_equal):
+            control.setEnabled(state_plot)
+        self._refresh_plot()
+
     def update_data(self, records: List[SolveRecord], lang: str = None):
         """Update the plot from provenance-compatible records."""
         self._set_records(records)
@@ -495,12 +575,14 @@ class IntegratedPlotWidget(QWidget):
             self.lang = lang
         self._visible = set(range(len(records)))
         self._rebuild_controls()
+        self._update_plot_type_choices()
         self._refresh_plot()
 
     def set_lang(self, lang: str):
         """切换界面语言."""
         self.lang = lang
         self._update_ui_texts()
+        self._update_plot_type_choices()
         self._refresh_plot()
 
     def _t(self, key: str) -> str:
@@ -518,6 +600,11 @@ class IntegratedPlotWidget(QWidget):
         panel_layout.setSpacing(6)
 
         self.form_layout = QFormLayout()
+
+        self.combo_plot_type = QComboBox()
+        self.combo_plot_type.currentIndexChanged.connect(self._on_plot_type_changed)
+        self._label_plot_type = QLabel()
+        self.form_layout.addRow(self._label_plot_type, self.combo_plot_type)
 
         # --- X 轴 ---
         self.combo_x = QComboBox()
@@ -610,6 +697,7 @@ class IntegratedPlotWidget(QWidget):
         self.diagnostic_label.setStyleSheet("color: #c0392b; font-size: 11px;")
         right.addWidget(self.diagnostic_label)
         main_layout.addLayout(right, 1)
+        self._update_plot_type_choices()
 
     def _populate_y_list(self):
         """填充 Y 轴列表: 状态变量 + [辅助变量]."""
@@ -677,6 +765,9 @@ class IntegratedPlotWidget(QWidget):
     def _refresh_plot(self):
         """核心: 根据当前控件状态重绘图像."""
         if not self.all_results:
+            return
+        if self.combo_plot_type.currentData() == "parameter":
+            self._refresh_parameter_plot()
             return
 
         x_axis = self.combo_x.currentData() or "t"
@@ -828,9 +919,56 @@ class IntegratedPlotWidget(QWidget):
         self.fig.tight_layout()
         self.canvas.draw()
 
+    def _refresh_parameter_plot(self) -> None:
+        """Plot only trajectories saved by the differential μ-integrator."""
+        curves = []
+        for index, record in enumerate(self.records):
+            if index not in self._visible:
+                continue
+            trajectory = self._parameter_trajectory(record)
+            if trajectory is not None:
+                mu, p_path = trajectory
+                labels = self._parameter_labels(record, p_path.shape[1])
+                curves.extend(
+                    (index, component, label, mu, p_path[:, component])
+                    for component, label in enumerate(labels)
+                )
+        self.plot_diagnostics = ()
+        self.diagnostic_label.setText("")
+        self.fig.clear()
+        ax = self.fig.add_subplot(111)
+        colors = [(31/255,119/255,180/255),(255/255,127/255,14/255),
+                  (44/255,160/255,44/255),(214/255,39/255,40/255)]
+        solution_count = len({curve[0] for curve in curves})
+        for index, component, label, mu, values in curves:
+            legend = label if solution_count == 1 else f"{label} #{index + 1}"
+            ax.plot(mu, values, color=colors[component % len(colors)],
+                    ls=("-", "--", ":", "-.")[
+                        (component if solution_count == 1 else index) % 4
+                    ],
+                    lw=self.spin_lw.value(), label=legend)
+        label_font = {}
+        if self.lang == "zh":
+            available_fonts = {font.name for font in font_manager.fontManager.ttflist}
+            for family in ("Noto Sans SC", "Microsoft YaHei", "SimHei", "HP Simplified Hans"):
+                if family in available_fonts:
+                    label_font = {"fontfamily": family}
+                    break
+        ax.set_title(self._t("parameter_title"), **label_font)
+        ax.set_xlabel(self._t("parameter_x_axis"), **label_font)
+        ax.set_ylabel(self._t("parameter_y_axis"), **label_font)
+        ax.set_xlim(0.0, 1.0)
+        if self.check_grid.isChecked():
+            ax.grid(True, alpha=0.3, ls="--")
+        if curves:
+            ax.legend(loc="best", fontsize=10, framealpha=0.9)
+        self.fig.tight_layout()
+        self.canvas.draw()
+
     def _update_ui_texts(self):
         """根据当前语言更新所有控件文本."""
         self.panel.setTitle(self._t("plot_controls"))
+        self._label_plot_type.setText(self._t("plot_type"))
         self._label_x.setText(self._t("x_axis"))
         self._label_y.setText(self._t("y_axes"))
         self._label_lw.setText(self._t("line_width"))
